@@ -240,6 +240,16 @@ class SessionTable:
     def iter_by_cwd(self, cwd: str | None) -> list[Session]:
         return [s for s in self._sessions.values() if s.cwd == cwd]
 
+    def iter_with_active_turn(self) -> list[Session]:
+        """Sessions whose subprocess is running and has a turn in flight."""
+        return [
+            s
+            for s in self._sessions.values()
+            if s.subprocess is not None
+            and s.subprocess.running
+            and s.subprocess.turn_active
+        ]
+
     # ------------------------------------------------------------------
     # Teardown
     # ------------------------------------------------------------------

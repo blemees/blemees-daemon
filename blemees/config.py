@@ -37,6 +37,11 @@ class Config:
     # When set, outbound frames are appended to ``<event_log_dir>/<session>.jsonl``.
     # Survives daemon restarts; seeds the ring buffer on reopen. Opt-in.
     event_log_dir: str | None = None
+    # On daemon shutdown, how long (seconds) to let in-flight turns run to
+    # completion before force-killing their subprocesses. Mirrors the
+    # client-disconnect soft-detach policy (§5.9). 0 disables (hard-kill
+    # immediately).
+    shutdown_grace_s: int = 30
 
 
 def default_socket_path() -> str:
@@ -66,6 +71,7 @@ def _env_overrides() -> dict[str, Any]:
         "BLEMEESD_IDLE_TIMEOUT": "idle_timeout_s",
         "BLEMEESD_RING_BUFFER_SIZE": "ring_buffer_size",
         "BLEMEESD_EVENT_LOG_DIR": "event_log_dir",
+        "BLEMEESD_SHUTDOWN_GRACE": "shutdown_grace_s",
     }
     out: dict[str, Any] = {}
     for env_name, field in mapping.items():

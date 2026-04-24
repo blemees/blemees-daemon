@@ -646,13 +646,31 @@ Reply `error{code:"invalid_message"}`, continue connection. Do not kill
 sessions.
 
 ### 9.5 Daemon shutdown (SIGINT/SIGTERM)
+
+Shutdown applies the same soft-detach policy as a client disconnect
+(§5.9): sessions with an in-flight turn are allowed to run to the next
+`claude.result` before being terminated, so their transcripts close
+cleanly.
+
 1. Stop accepting new connections.
 2. Emit `error{code:"daemon_shutdown"}` on every live connection.
-3. SIGTERM every child. 2 s later, SIGKILL stragglers.
-4. Close sockets, unlink socket file.
-5. Exit 0.
+3. For every session with `turn_active=True`, set `_finishing=True`.
+   Events continue to accumulate in the ring buffer and (if enabled)
+   durable log, so a client that reconnects to a restarted daemon can
+   replay them via `last_seen_seq`.
+4. Wait up to `shutdown_grace_s` seconds (default 30) for finishing
+   subprocesses to reach their next `claude.result` and self-terminate.
+   Idle sessions (no turn in flight) are not subject to this wait.
+5. Force phase: SIGTERM every remaining child, 500 ms grace, then
+   SIGKILL stragglers. Bounded by a 5 s budget.
+6. Close sockets, unlink socket file.
+7. Exit 0.
 
-Overall shutdown budget 5 s, then force-exit 1.
+Overall wall-clock budget is therefore `shutdown_grace_s + 5 s`. Past
+that, the daemon force-exits 1.
+
+Set `shutdown_grace_s=0` (via `BLEMEESD_SHUTDOWN_GRACE` env or config)
+to disable the graceful phase and hard-kill immediately.
 
 ### 9.6 Stale socket file on startup
 - `connect()` succeeds → another daemon is running; exit 1 with message.

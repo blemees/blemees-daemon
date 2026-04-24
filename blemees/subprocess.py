@@ -198,6 +198,20 @@ class ClaudeSubprocess:
         await self._kill()
         await self._drain_readers()
 
+    async def wait_for_exit(self, timeout: float) -> bool:
+        """Return ``True`` if the subprocess has exited within ``timeout`` seconds.
+
+        Used by the daemon's graceful-shutdown path to block on sessions that
+        are finishing their current turn before force-killing stragglers.
+        """
+        if self.proc is None or self.proc.returncode is not None:
+            return True
+        try:
+            await asyncio.wait_for(self.proc.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
     async def _drain_readers(self) -> None:
         for task in self._reader_tasks:
             if not task.done():

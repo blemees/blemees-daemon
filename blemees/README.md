@@ -213,6 +213,14 @@ Precedence (high → low): CLI flag > env var > `~/.config/blemeesd/config.toml`
 | `log_file` | `--log-file` | `BLEMEESD_LOG_FILE` | stderr |
 | `idle_timeout_s` | — | `BLEMEESD_IDLE_TIMEOUT` | `900` |
 | `max_line_bytes` | — | `BLEMEESD_MAX_LINE` | `16777216` |
+| `ring_buffer_size` | — | `BLEMEESD_RING_BUFFER_SIZE` | `1024` |
+| `event_log_dir` | — | `BLEMEESD_EVENT_LOG_DIR` | (disabled) |
+| `shutdown_grace_s` | — | `BLEMEESD_SHUTDOWN_GRACE` | `30` |
+
+`shutdown_grace_s` mirrors the client-disconnect soft-detach policy
+(§5.9): on daemon shutdown, sessions with an in-flight turn are allowed
+to run to the next `claude.result` before being terminated. Set to `0`
+to hard-kill immediately.
 
 Example `config.toml`:
 

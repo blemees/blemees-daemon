@@ -125,6 +125,37 @@ def main() -> int:
             except BrokenPipeError:
                 return 0
 
+        if mode == "finish":
+            # Streams a delta, waits a configurable window, then emits a
+            # natural result. Used by daemon-shutdown tests to observe the
+            # "wait for turn to complete" grace-period behaviour.
+            delay_s = float(os.environ.get("BLEMEES_FAKE_FINISH_DELAY_S", "0.3"))
+            _emit(
+                {
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_delta",
+                        "delta": {"type": "text_delta", "text": "."},
+                    },
+                }
+            )
+            time.sleep(delay_s)
+            _emit(
+                {
+                    "type": "assistant",
+                    "message": {"role": "assistant", "content": [{"type": "text", "text": "."}]},
+                }
+            )
+            _emit(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "duration_ms": int(delay_s * 1000),
+                    "num_turns": 1,
+                }
+            )
+            continue
+
         # Normal / echo path.
         reply = text if mode == "echo" else f"ok:{text}"
         _emit(

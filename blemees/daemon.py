@@ -683,7 +683,33 @@ class Daemon:
             with contextlib.suppress(Exception):
                 await conn.broadcast_shutdown()
 
-        # Tear down sessions; their subprocesses are SIGTERM'd with 500 ms grace.
+        # Graceful phase: let sessions with an in-flight turn run to the next
+        # claude.result so their transcript closes cleanly. Same soft-detach
+        # policy as client disconnect (§5.9). Capped by shutdown_grace_s.
+        grace = self._config.shutdown_grace_s
+        active = self._sessions.iter_with_active_turn()
+        for sess in active:
+            sess.mark_finishing()
+        if active and grace > 0:
+            self._log.info(
+                "daemon.shutdown_waiting_for_turns",
+                count=len(active),
+                grace_s=grace,
+            )
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *(s.subprocess.wait_for_exit(grace) for s in active),
+                        return_exceptions=True,
+                    ),
+                    timeout=grace,
+                )
+            except asyncio.TimeoutError:
+                self._log.warning(
+                    "daemon.shutdown_grace_expired", still_running=len(active)
+                )
+
+        # Force phase: kill anything still alive.
         try:
             await asyncio.wait_for(
                 self._sessions.shutdown(), timeout=_SHUTDOWN_BUDGET_S
