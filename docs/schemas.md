@@ -1,7 +1,6 @@
 ---
 title: JSON Schemas
 nav_order: 3
-permalink: /schemas/
 ---
 
 <!-- Auto-synced from schemas/README.md by .github/workflows/docs-sync.yml. -->
