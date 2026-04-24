@@ -15,6 +15,10 @@ schemas/
     blemeesd.interrupt.json
     blemeesd.close.json
     blemeesd.list_sessions.json
+    blemeesd.ping.json
+    blemeesd.status.json
+    blemeesd.watch.json
+    blemeesd.unwatch.json
     claude.user.json
   outbound/                  # daemon → client frames
     blemeesd.hello_ack.json
@@ -26,6 +30,10 @@ schemas/
     blemeesd.replay_gap.json
     blemeesd.sessions.json
     blemeesd.session_taken.json
+    blemeesd.pong.json
+    blemeesd.status_reply.json
+    blemeesd.watching.json
+    blemeesd.unwatched.json
     claude.event.json        # envelope for every forwarded CC event
 ```
 

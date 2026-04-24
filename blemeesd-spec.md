@@ -471,6 +471,75 @@ Omitting `last_seen_seq` on reattach replays whatever is currently in
 the ring. Passing `last_seen_seq` equal to the session's current `seq`
 skips replay and goes straight to live delivery.
 
+### 5.12 Liveness (ping / pong)
+
+Client:
+```json
+{"type":"blemeesd.ping","id":"req_1","data":"anything"}
+```
+Daemon:
+```json
+{"type":"blemeesd.pong","id":"req_1","data":"anything"}
+```
+`data` is opaque and echoed verbatim. `id` is recommended for
+round-trip correlation. Both fields are optional.
+
+### 5.13 Status introspection
+
+Client:
+```json
+{"type":"blemeesd.status","id":"req_2"}
+```
+Daemon:
+```json
+{
+  "type":"blemeesd.status_reply","id":"req_2",
+  "daemon":"blemeesd/0.1.0","protocol":"blemees/1","pid":12345,
+  "claude_version":"2.1.118","uptime_s":127.3,
+  "socket_path":"/run/user/1000/blemeesd.sock",
+  "connections":3,
+  "sessions":{"total":5,"attached":4,"detached":1,"active_turns":2},
+  "config":{
+    "ring_buffer_size":1024,"event_log_enabled":false,
+    "idle_timeout_s":900,"shutdown_grace_s":30,
+    "max_concurrent_sessions":64,"max_line_bytes":16777216
+  }
+}
+```
+No side effects. Forward-compatible: new fields may be added inside
+`sessions` / `config`, and new top-level keys may appear.
+
+### 5.14 Watch (subscribe-only observer)
+
+A second connection may subscribe to an existing session's event
+stream without taking ownership. The owner keeps driving the session;
+watchers receive the same `claude.*` events, `blemeesd.stderr`,
+`blemeesd.error{claude_crashed,oauth_expired}`, and `blemeesd.replay_gap`
+frames the owner does, plus an optional replay on subscribe.
+
+Client:
+```json
+{"type":"blemeesd.watch","id":"req_3","session_id":"s_abc","last_seen_seq":0}
+```
+Daemon (ack, then event stream):
+```json
+{"type":"blemeesd.watching","id":"req_3","session_id":"s_abc","last_seq":42}
+```
+Unknown session → `blemeesd.error{code:"session_unknown"}`. Multiple
+connections may watch the same session. Watchers cannot drive:
+`claude.user`, `blemeesd.interrupt`, `blemeesd.close`, and
+`blemeesd.session_taken` remain connection-scoped to the owner.
+
+Unsubscribe:
+```json
+{"type":"blemeesd.unwatch","id":"req_4","session_id":"s_abc"}
+```
+Reply:
+```json
+{"type":"blemeesd.unwatched","id":"req_4","session_id":"s_abc","was_watching":true}
+```
+Watchers are also automatically removed when the connection closes.
+
 ---
 
 ## 6. Subprocess Management
@@ -809,11 +878,15 @@ asyncio.run(main())
 
 ---
 
-## Appendix B: Reserved message types (refuse with `unknown_message` in v0.1)
+## Appendix B: Reserved message types
 
-Do not treat as unknown; refuse explicitly so the wire versioning stays clean:
+All originally-reserved verbs are now implemented and live on `blemees/1`:
 
-- `blemeesd.ping` / `blemeesd.pong` — liveness (v0.2).
-- `blemeesd.status` — daemon introspection (v0.2).
-- `blemeesd.list_sessions` — enumerate (v0.2).
-- `blemeesd.watch` — tail events from a session without driving it (v0.2).
+- `blemeesd.ping` / `blemeesd.pong` — liveness. See §5.12.
+- `blemeesd.status` / `blemeesd.status_reply` — daemon introspection. See §5.13.
+- `blemeesd.list_sessions` / `blemeesd.sessions` — enumerate. See §5.5 list_sessions note.
+- `blemeesd.watch` / `blemeesd.watching` / `blemeesd.unwatch` / `blemeesd.unwatched` — subscribe-only observer stream. See §5.14.
+
+Future additions may re-reserve names; the daemon's `_RESERVED_TYPES`
+set is kept in code so unimplemented-but-reserved verbs get a deterministic
+`unknown_message` response rather than silently looking like unknown types.

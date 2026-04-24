@@ -135,6 +135,19 @@ class ListSessionsMessage:
     cwd: str
 
 
+@dataclasses.dataclass(slots=True)
+class WatchMessage:
+    id: str | None
+    session_id: str
+    last_seen_seq: int | None
+
+
+@dataclasses.dataclass(slots=True)
+class UnwatchMessage:
+    id: str | None
+    session_id: str
+
+
 def parse_hello(obj: dict[str, Any]) -> HelloMessage:
     protocol = obj.get("protocol")
     if not isinstance(protocol, str):
@@ -306,6 +319,29 @@ def parse_list_sessions(obj: dict[str, Any]) -> ListSessionsMessage:
     if req_id is not None and not isinstance(req_id, str):
         raise ProtocolError("'id' must be a string")
     return ListSessionsMessage(id=req_id, cwd=cwd)
+
+
+def parse_watch(obj: dict[str, Any]) -> WatchMessage:
+    session_id = obj.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        raise ProtocolError("watch requires 'session_id'")
+    req_id = obj.get("id")
+    if req_id is not None and not isinstance(req_id, str):
+        raise ProtocolError("'id' must be a string")
+    last_seen_seq = obj.get("last_seen_seq")
+    if last_seen_seq is not None and (not isinstance(last_seen_seq, int) or last_seen_seq < 0):
+        raise ProtocolError("'last_seen_seq' must be a non-negative integer")
+    return WatchMessage(id=req_id, session_id=session_id, last_seen_seq=last_seen_seq)
+
+
+def parse_unwatch(obj: dict[str, Any]) -> UnwatchMessage:
+    session_id = obj.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        raise ProtocolError("unwatch requires 'session_id'")
+    req_id = obj.get("id")
+    if req_id is not None and not isinstance(req_id, str):
+        raise ProtocolError("'id' must be a string")
+    return UnwatchMessage(id=req_id, session_id=session_id)
 
 
 # ---------------------------------------------------------------------------

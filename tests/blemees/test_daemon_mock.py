@@ -87,11 +87,12 @@ async def test_unknown_message_returns_error(client_factory):
     assert err["code"] == "unknown_message"
 
 
-async def test_reserved_types_return_unknown(client_factory):
+async def test_ping_replies_with_pong(client_factory):
     client = await client_factory()
-    await client.send({"type": "blemeesd.ping"})
-    err = await client.wait_for(lambda e: e.get("type") == "blemeesd.error")
-    assert err["code"] == "unknown_message"
+    await client.send({"type": "blemeesd.ping", "id": "ping-1", "data": 42})
+    pong = await client.wait_for(lambda e: e.get("type") == "blemeesd.pong")
+    assert pong["id"] == "ping-1"
+    assert pong["data"] == 42
 
 
 async def test_session_flag_mapping_in_argv(
@@ -278,8 +279,8 @@ async def test_invalid_message_keeps_connection_alive(client_factory):
     await client.send({"type": "blemeesd.open", "id": "bad"})
     err = await client.wait_for(lambda e: e.get("type") == "blemeesd.error")
     assert err["code"] == "invalid_message"
-    # Connection still usable.
-    await client.send({"type": "blemeesd.ping"})
+    # Connection still usable: a truly unknown type still returns unknown.
+    await client.send({"type": "blemeesd.nonsense_xyz"})
     err2 = await client.wait_for(lambda e: e.get("type") == "blemeesd.error")
     assert err2["code"] == "unknown_message"
 
@@ -450,3 +451,141 @@ async def test_no_takeover_notice_for_same_connection_reopen(
         collect=True,
     )
     assert not any(e.get("type") == "blemeesd.session_taken" for e in collected)
+
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+
+async def test_status_returns_snapshot(client_factory, fake_mode):
+    fake_mode("normal")
+    client = await client_factory()
+    await client.send({"type": "blemeesd.status", "id": "s-1"})
+    reply = await client.wait_for(lambda e: e.get("type") == "blemeesd.status_reply")
+    assert reply["id"] == "s-1"
+    assert reply["protocol"] == "blemees/1"
+    assert reply["daemon"].startswith("blemeesd/")
+    assert reply["pid"] > 0
+    assert reply["uptime_s"] >= 0.0
+    assert reply["connections"] >= 1
+    assert reply["sessions"] == {
+        "total": 0,
+        "attached": 0,
+        "detached": 0,
+        "active_turns": 0,
+    }
+    cfg = reply["config"]
+    assert cfg["ring_buffer_size"] > 0
+    assert "shutdown_grace_s" in cfg
+
+
+async def test_status_reflects_open_sessions(client_factory, fake_mode):
+    fake_mode("normal")
+    client = await client_factory()
+    await client.send({"type": "blemeesd.open", "id": "r1", "session_id": "x", "tools": ""})
+    await client.wait_for(lambda e: e.get("type") == "blemeesd.opened")
+    await client.send({"type": "blemeesd.status"})
+    reply = await client.wait_for(lambda e: e.get("type") == "blemeesd.status_reply")
+    assert reply["sessions"]["total"] == 1
+    assert reply["sessions"]["attached"] == 1
+
+
+# ---------------------------------------------------------------------------
+# watch / unwatch
+# ---------------------------------------------------------------------------
+
+async def test_watch_receives_events_live(client_factory, fake_mode):
+    fake_mode("normal")
+    owner = await client_factory()
+    watcher = await client_factory()
+
+    await owner.send({"type": "blemeesd.open", "id": "r1", "session_id": "shared", "tools": ""})
+    await owner.wait_for(lambda e: e.get("type") == "blemeesd.opened")
+
+    await watcher.send({"type": "blemeesd.watch", "id": "w1", "session_id": "shared"})
+    ack = await watcher.wait_for(lambda e: e.get("type") == "blemeesd.watching")
+    assert ack["session_id"] == "shared"
+
+    # Drive a turn on the owner; the watcher should see the same event stream.
+    await owner.send(
+        {
+            "type": "claude.user",
+            "session_id": "shared",
+            "message": {"role": "user", "content": "hi"},
+        }
+    )
+    await watcher.wait_for(
+        lambda e: e.get("type") == "claude.result" and e.get("session_id") == "shared"
+    )
+
+
+async def test_watch_replays_from_last_seen_seq(client_factory, fake_mode):
+    fake_mode("normal")
+    owner = await client_factory()
+    await owner.send({"type": "blemeesd.open", "id": "r1", "session_id": "rep", "tools": ""})
+    await owner.wait_for(lambda e: e.get("type") == "blemeesd.opened")
+    await owner.send(
+        {
+            "type": "claude.user",
+            "session_id": "rep",
+            "message": {"role": "user", "content": "hi"},
+        }
+    )
+    await owner.wait_for(
+        lambda e: e.get("type") == "claude.result" and e.get("session_id") == "rep"
+    )
+
+    watcher = await client_factory()
+    await watcher.send(
+        {
+            "type": "blemeesd.watch",
+            "id": "w1",
+            "session_id": "rep",
+            "last_seen_seq": 0,
+        }
+    )
+    await watcher.wait_for(lambda e: e.get("type") == "blemeesd.watching")
+    # Should catch up through the replay and see the completed turn.
+    await watcher.wait_for(
+        lambda e: e.get("type") == "claude.result" and e.get("session_id") == "rep"
+    )
+
+
+async def test_unwatch_stops_delivery(client_factory, fake_mode):
+    fake_mode("normal")
+    owner = await client_factory()
+    watcher = await client_factory()
+    await owner.send({"type": "blemeesd.open", "id": "r1", "session_id": "u", "tools": ""})
+    await owner.wait_for(lambda e: e.get("type") == "blemeesd.opened")
+    await watcher.send({"type": "blemeesd.watch", "id": "w1", "session_id": "u"})
+    await watcher.wait_for(lambda e: e.get("type") == "blemeesd.watching")
+
+    await watcher.send({"type": "blemeesd.unwatch", "id": "u1", "session_id": "u"})
+    ack = await watcher.wait_for(lambda e: e.get("type") == "blemeesd.unwatched")
+    assert ack["was_watching"] is True
+
+    # Now drive a turn; the watcher should NOT see claude.result.
+    await owner.send(
+        {
+            "type": "claude.user",
+            "session_id": "u",
+            "message": {"role": "user", "content": "go"},
+        }
+    )
+    await owner.wait_for(
+        lambda e: e.get("type") == "claude.result" and e.get("session_id") == "u"
+    )
+    # Give event propagation a beat, then confirm the watcher queue is idle.
+    await asyncio.sleep(0.1)
+    try:
+        evt = await watcher.recv(timeout=0.2)
+        assert evt.get("type") != "claude.result", f"unexpected frame {evt}"
+    except asyncio.TimeoutError:
+        pass
+
+
+async def test_watch_unknown_session_errors(client_factory):
+    client = await client_factory()
+    await client.send({"type": "blemeesd.watch", "id": "w1", "session_id": "ghost"})
+    err = await client.wait_for(lambda e: e.get("type") == "blemeesd.error")
+    assert err["code"] == "session_unknown"

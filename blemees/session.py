@@ -53,6 +53,12 @@ class Session:
     _writer: Optional[WriterFn] = None
     _finishing: bool = False  # subprocess keeps running, kill on next result
 
+    # Non-driving subscribers: connection_id → writer. Watchers receive every
+    # frame the primary writer gets (claude.* events, blemeesd.stderr,
+    # blemeesd.error{claude_crashed,oauth_expired}, and replays on subscribe)
+    # but cannot drive the session (user/interrupt/close).
+    _watchers: dict[int, WriterFn] = field(default_factory=dict)
+
     extra: dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
@@ -82,6 +88,16 @@ class Session:
                 # The writer's dead; treat as a silent detach. The session
                 # stays live so a future attach can still replay.
                 self._writer = None
+        # Fan out to watchers. A failed watcher is silently dropped.
+        if self._watchers:
+            dead: list[int] = []
+            for conn_id, w in self._watchers.items():
+                try:
+                    await w(frame)
+                except Exception:
+                    dead.append(conn_id)
+            for conn_id in dead:
+                self._watchers.pop(conn_id, None)
         # Soft-kill after a completed turn when the client has left. We
         # match on the namespaced form emitted by the subprocess reader.
         if self._finishing and frame.get("type") == "claude.result":
@@ -157,6 +173,45 @@ class Session:
     def mark_finishing(self) -> None:
         """Ask the subprocess to self-kill after the current turn ends."""
         self._finishing = True
+
+    async def add_watcher(
+        self,
+        connection_id: int,
+        writer: WriterFn,
+        *,
+        last_seen_seq: int | None = None,
+    ) -> dict:
+        """Subscribe a non-driving writer. Replays missed frames if asked.
+
+        Returns a ``{replayed, gap_from, gap_to}`` summary, same shape as
+        :meth:`attach`.
+        """
+        # If this connection was already watching (e.g. re-watch), refresh.
+        self._watchers[connection_id] = writer
+        summary = {"replayed": 0, "gap_from": 0, "gap_to": 0}
+        if last_seen_seq is None:
+            return summary
+        to_replay = self.ring.since(last_seen_seq)
+        earliest = self.ring.earliest_seq()
+        if earliest is not None and earliest > last_seen_seq + 1:
+            await writer(
+                {
+                    "type": "blemeesd.replay_gap",
+                    "session_id": self.session_id,
+                    "since_seq": last_seen_seq,
+                    "first_available_seq": earliest,
+                }
+            )
+            summary["gap_from"] = last_seen_seq + 1
+            summary["gap_to"] = earliest - 1
+        for frame in to_replay:
+            await writer(frame)
+        summary["replayed"] = len(to_replay)
+        return summary
+
+    def remove_watcher(self, connection_id: int) -> bool:
+        """Unsubscribe a watcher. Returns ``True`` if it was registered."""
+        return self._watchers.pop(connection_id, None) is not None
 
     # ------------------------------------------------------------------
     # Log setup
@@ -277,6 +332,17 @@ class SessionTable:
                 await self.detach_soft(sess.session_id)
                 detached.append(sess.session_id)
         return detached
+
+    def remove_all_watchers_for_connection(self, connection_id: int) -> int:
+        """Unsubscribe ``connection_id`` from every session it was watching.
+
+        Returns the number of subscriptions removed. Cheap — no I/O.
+        """
+        n = 0
+        for sess in self._sessions.values():
+            if sess.remove_watcher(connection_id):
+                n += 1
+        return n
 
     async def remove(self, session_id: str, *, delete_file: bool = False) -> None:
         async with self._lock:

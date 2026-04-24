@@ -58,24 +58,20 @@ from .protocol import (
     parse_line,
     parse_list_sessions,
     parse_open,
+    parse_unwatch,
     parse_user,
+    parse_watch,
 )
 from .session import Session, SessionTable, make_reaper
 from .subprocess import ClaudeSubprocess, list_session_files
 
 
-# Reserved `blemeesd.*` types that v0.1 explicitly refuses with
-# ``unknown_message`` (Appendix B). ``list_sessions`` was reserved in the
-# original spec but unreserved here in v0.1.1 — clients need parity with
-# the interactive ``/resume`` discovery flow.
-_RESERVED_TYPES = frozenset(
-    {
-        "blemeesd.ping",
-        "blemeesd.pong",
-        "blemeesd.status",
-        "blemeesd.watch",
-    }
-)
+# Reserved `blemeesd.*` types that the daemon explicitly refuses with
+# ``unknown_message`` (Appendix B). All four originally-reserved verbs
+# (list_sessions, ping, status, watch) are now implemented, so this set
+# is currently empty — kept as an explicit place to re-reserve names as
+# future protocol additions are negotiated.
+_RESERVED_TYPES: frozenset[str] = frozenset()
 
 # How long the writer may be stuck before we declare a slow consumer.
 _SLOW_CONSUMER_TIMEOUT_S = 30.0
@@ -126,6 +122,7 @@ class Connection:
         claude_version: str | None,
         shutdown_event: asyncio.Event,
         lookup_connection: "Callable[[int], Connection | None] | None" = None,
+        status_snapshot: "Callable[[], dict[str, Any]] | None" = None,
     ) -> None:
         self.id = self._next_id()
         self._reader = reader
@@ -135,12 +132,14 @@ class Connection:
         self._claude_version = claude_version
         self._shutdown = shutdown_event
         self._lookup_connection = lookup_connection
+        self._status_snapshot = status_snapshot
 
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=_CONNECTION_QUEUE_SIZE)
         self._alive = True
         self._fatal = False
         self._writer_last_progress = time.monotonic()
         self._owned_sessions: set[str] = set()
+        self._watched_sessions: set[str] = set()
         self._peer_pid: int | None = None
         self._peer_uid: int | None = None
 
@@ -172,8 +171,10 @@ class Connection:
             watchdog_task.cancel()
             with contextlib.suppress(BaseException):
                 await watchdog_task
-            # Detach sessions owned by this connection (spec §5.9).
+            # Detach sessions owned by this connection (spec §5.9) and
+            # unsubscribe any watch subscriptions.
             await self._sessions.detach_all_for_connection(self.id)
+            self._sessions.remove_all_watchers_for_connection(self.id)
             try:
                 self._writer.close()
                 await self._writer.wait_closed()
@@ -269,6 +270,14 @@ class Connection:
                 await self._handle_close(parse_close(obj))
             elif msg_type == "blemeesd.list_sessions":
                 await self._handle_list_sessions(parse_list_sessions(obj))
+            elif msg_type == "blemeesd.ping":
+                await self._handle_ping(obj)
+            elif msg_type == "blemeesd.status":
+                await self._handle_status(obj)
+            elif msg_type == "blemeesd.watch":
+                await self._handle_watch(parse_watch(obj))
+            elif msg_type == "blemeesd.unwatch":
+                await self._handle_unwatch(parse_unwatch(obj))
             elif msg_type == "blemeesd.hello":
                 await self._emit_error(
                     INVALID_MESSAGE, "duplicate hello", id=obj.get("id")
@@ -468,6 +477,76 @@ class Connection:
             {"type": "blemeesd.closed", "id": msg.id, "session_id": msg.session_id}
         )
 
+    async def _handle_ping(self, obj: dict[str, Any]) -> None:
+        """Liveness check: reply with ``blemeesd.pong`` carrying the client's id.
+
+        A ``data`` field on the ping is echoed back so clients can round-trip a
+        correlation token without relying solely on ``id``.
+        """
+        frame: dict[str, Any] = {"type": "blemeesd.pong", "id": obj.get("id")}
+        if "data" in obj:
+            frame["data"] = obj["data"]
+        await self._emit_frame(frame)
+
+    async def _handle_status(self, obj: dict[str, Any]) -> None:
+        """Daemon-wide introspection snapshot. No side effects.
+
+        The snapshot payload is assembled by the :class:`Daemon` via the
+        ``status_snapshot`` callable passed into this connection at accept
+        time — it has visibility the per-connection handler does not (e.g.
+        total connection count, daemon uptime).
+        """
+        snap: dict[str, Any] = (
+            self._status_snapshot() if self._status_snapshot is not None else {}
+        )
+        frame = {"type": "blemeesd.status_reply", "id": obj.get("id"), **snap}
+        await self._emit_frame(frame)
+
+    async def _handle_watch(self, msg) -> None:
+        """Subscribe to a session's event stream without driving it."""
+        sess = self._sessions.try_get(msg.session_id)
+        if sess is None:
+            await self._emit_error(
+                SESSION_UNKNOWN,
+                f"no such session: {msg.session_id}",
+                id=msg.id,
+                session_id=msg.session_id,
+            )
+            return
+        await self._emit_frame(
+            {
+                "type": "blemeesd.watching",
+                "id": msg.id,
+                "session_id": msg.session_id,
+                "last_seq": sess.seq,
+            }
+        )
+        summary = await sess.add_watcher(
+            self.id, self._enqueue_to_writer, last_seen_seq=msg.last_seen_seq
+        )
+        self._watched_sessions.add(msg.session_id)
+        self._log.info(
+            "session.watched",
+            session_id=msg.session_id,
+            replayed=summary.get("replayed", 0),
+        )
+
+    async def _handle_unwatch(self, msg) -> None:
+        """Unsubscribe a prior ``blemeesd.watch``. No-op if not watching."""
+        sess = self._sessions.try_get(msg.session_id)
+        removed = False
+        if sess is not None:
+            removed = sess.remove_watcher(self.id)
+        self._watched_sessions.discard(msg.session_id)
+        await self._emit_frame(
+            {
+                "type": "blemeesd.unwatched",
+                "id": msg.id,
+                "session_id": msg.session_id,
+                "was_watching": removed,
+            }
+        )
+
     # ------------------------------------------------------------------
     # Writer side
     # ------------------------------------------------------------------
@@ -616,6 +695,7 @@ class Daemon:
         self._shutdown_event = asyncio.Event()
         self._reaper_task: asyncio.Task | None = None
         self._claude_version: str | None = None
+        self._start_time: float = time.monotonic()
 
     async def start(self) -> None:
         self._claude_version = detect_claude_version(self._config.claude_bin)
@@ -647,6 +727,7 @@ class Daemon:
             claude_version=self._claude_version,
             shutdown_event=self._shutdown_event,
             lookup_connection=self._lookup_connection,
+            status_snapshot=self._status_snapshot,
         )
         self._connections.add(conn)
         try:
@@ -659,6 +740,37 @@ class Daemon:
             if c.id == connection_id:
                 return c
         return None
+
+    def _status_snapshot(self) -> dict[str, Any]:
+        """Assemble the payload for a ``blemeesd.status_reply`` frame."""
+        now = time.monotonic()
+        sessions = list(self._sessions._sessions.values())
+        total = len(sessions)
+        attached = sum(1 for s in sessions if s.connection_id is not None)
+        active = len(self._sessions.iter_with_active_turn())
+        return {
+            "daemon": f"blemeesd/{__version__}",
+            "protocol": PROTOCOL_VERSION,
+            "pid": os.getpid(),
+            "claude_version": self._claude_version,
+            "uptime_s": round(now - self._start_time, 3),
+            "socket_path": self._config.socket_path,
+            "connections": len(self._connections),
+            "sessions": {
+                "total": total,
+                "attached": attached,
+                "detached": total - attached,
+                "active_turns": active,
+            },
+            "config": {
+                "ring_buffer_size": self._config.ring_buffer_size,
+                "event_log_enabled": bool(self._config.event_log_dir),
+                "idle_timeout_s": self._config.idle_timeout_s,
+                "shutdown_grace_s": self._config.shutdown_grace_s,
+                "max_concurrent_sessions": self._config.max_concurrent_sessions,
+                "max_line_bytes": self._config.max_line_bytes,
+            },
+        }
 
     async def serve_forever(self) -> None:
         assert self._server is not None
