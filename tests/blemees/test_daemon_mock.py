@@ -378,3 +378,75 @@ async def test_list_sessions_flags_attached(
     records = {s["session"]: s for s in reply["sessions"]}
     assert "live" in records
     assert records["live"]["attached"] is True
+
+
+# ---------------------------------------------------------------------------
+# Session takeover
+# ---------------------------------------------------------------------------
+
+async def test_takeover_notifies_previous_owner(client_factory, fake_mode):
+    fake_mode("normal")
+    a = await client_factory()
+    b = await client_factory()
+
+    await a.send({"type": "blemeesd.open", "id": "r1", "session": "shared", "tools": ""})
+    await a.wait_for(lambda e: e.get("type") == "blemeesd.opened")
+
+    # B takes over via resume=true.
+    await b.send(
+        {
+            "type": "blemeesd.open",
+            "id": "r2",
+            "session": "shared",
+            "resume": True,
+            "tools": "",
+        }
+    )
+
+    # A must see the notification.
+    notice = await a.wait_for(
+        lambda e: e.get("type") == "blemeesd.session_taken"
+        and e.get("session") == "shared"
+    )
+    # Informational peer_pid may be absent in tests (no SO_PEERCRED capture
+    # for in-process unix sockets on some kernels), but the frame must arrive.
+    assert notice["session"] == "shared"
+
+    # B's ack arrives and the event stream now flows to B.
+    await b.wait_for(lambda e: e.get("type") == "blemeesd.opened")
+    await b.send(
+        {
+            "type": "claude.user",
+            "session": "shared",
+            "message": {"role": "user", "content": "hi"},
+        }
+    )
+    await b.wait_for(
+        lambda e: e.get("type") == "claude.result" and e.get("session") == "shared"
+    )
+
+
+async def test_no_takeover_notice_for_same_connection_reopen(
+    client_factory, fake_mode
+):
+    fake_mode("normal")
+    c = await client_factory()
+    await c.send({"type": "blemeesd.open", "id": "r1", "session": "self", "tools": ""})
+    await c.wait_for(lambda e: e.get("type") == "blemeesd.opened")
+
+    # Reopen from the same connection with resume=true — no takeover.
+    await c.send(
+        {
+            "type": "blemeesd.open",
+            "id": "r2",
+            "session": "self",
+            "resume": True,
+            "tools": "",
+        }
+    )
+    # The opened ack arrives; no session_taken in between.
+    collected = await c.wait_for(
+        lambda e: e.get("id") == "r2" and e.get("type") == "blemeesd.opened",
+        collect=True,
+    )
+    assert not any(e.get("type") == "blemeesd.session_taken" for e in collected)

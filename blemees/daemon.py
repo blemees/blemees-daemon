@@ -19,7 +19,7 @@ import subprocess as _stdlib_subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import PROTOCOL_VERSION, __version__
 from .config import Config
@@ -125,6 +125,7 @@ class Connection:
         logger: StructuredLogger,
         claude_version: str | None,
         shutdown_event: asyncio.Event,
+        lookup_connection: "Callable[[int], Connection | None] | None" = None,
     ) -> None:
         self.id = self._next_id()
         self._reader = reader
@@ -133,6 +134,7 @@ class Connection:
         self._sessions = sessions
         self._claude_version = claude_version
         self._shutdown = shutdown_event
+        self._lookup_connection = lookup_connection
 
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=_CONNECTION_QUEUE_SIZE)
         self._alive = True
@@ -298,6 +300,19 @@ class Connection:
 
         if msg.resume:
             if existing is not None:
+                # Takeover: if another connection currently owns this session,
+                # tell it before we swap the writer out from under it.
+                prev_id = existing.connection_id
+                if (
+                    prev_id is not None
+                    and prev_id != self.id
+                    and self._lookup_connection is not None
+                ):
+                    prev = self._lookup_connection(prev_id)
+                    if prev is not None:
+                        await prev.notify_session_taken(
+                            msg.session, by_peer_pid=self._peer_pid
+                        )
                 existing.open_msg = msg  # refresh flags on reattach
                 sess = existing
             else:
@@ -562,6 +577,24 @@ class Connection:
         await self._send_error_sync(DAEMON_SHUTDOWN, "daemon shutting down")
         self._alive = False
 
+    async def notify_session_taken(
+        self, session_id: str, *, by_peer_pid: int | None
+    ) -> None:
+        """Inform this connection that another connection has taken over a session.
+
+        Emitted before the new owner is attached. The session is dropped from
+        this connection's owned set so the subsequent detach-on-close doesn't
+        fight the new owner over it. Events stop flowing here immediately.
+        """
+        self._owned_sessions.discard(session_id)
+        frame: dict[str, Any] = {"type": "blemeesd.session_taken", "session": session_id}
+        if by_peer_pid is not None:
+            frame["by_peer_pid"] = by_peer_pid
+        await self._emit_frame(frame)
+        self._log.info(
+            "session.taken_notified", session_id=session_id, by_peer_pid=by_peer_pid
+        )
+
 
 # ---------------------------------------------------------------------------
 # Daemon
@@ -613,12 +646,19 @@ class Daemon:
             logger=self._log,
             claude_version=self._claude_version,
             shutdown_event=self._shutdown_event,
+            lookup_connection=self._lookup_connection,
         )
         self._connections.add(conn)
         try:
             await conn.serve()
         finally:
             self._connections.discard(conn)
+
+    def _lookup_connection(self, connection_id: int) -> "Connection | None":
+        for c in self._connections:
+            if c.id == connection_id:
+                return c
+        return None
 
     async def serve_forever(self) -> None:
         assert self._server is not None

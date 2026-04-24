@@ -371,6 +371,31 @@ diverging the model's conversation state from what the client last saw.
 Letting the turn complete closes the transcript cleanly and makes mid-
 stream reconnects a replay problem, not a consistency problem.
 
+#### 5.9.1 Session takeover
+
+A second connection may open a session that is currently owned by
+another live connection (via `resume: true`). The daemon allows the
+takeover and notifies the previous owner *before* switching the writer:
+
+```json
+{"type":"blemeesd.session_taken","session":"s_abc","by_peer_pid":12345}
+```
+
+After this frame the previous connection stops receiving events for
+that session; its other sessions (if any) are unaffected and its
+socket stays open. `by_peer_pid` reflects the new owner's peer PID
+from `SO_PEERCRED` when available, for debugging/audit; it is absent
+when the kernel or platform does not expose it.
+
+If the ex-owner wants the session back, it may itself send `open`
+with `resume: true` — which will in turn notify the current owner.
+Ping-pong is the clients' problem; the daemon does not arbitrate.
+
+The new owner's subsequent replay (via `last_seen_seq`) works as
+usual — the ring buffer is session-local, not connection-local, so
+frames emitted while the ex-owner held the writer are still
+available to the new owner.
+
 ### 5.10 Errors
 
 Errors are `blemeesd.error` frames with a machine-readable `code`. The daemon
