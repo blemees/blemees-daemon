@@ -576,3 +576,167 @@ async def test_watch_unknown_session_errors(client_factory):
     await client.send({"type": "blemeesd.watch", "id": "w1", "session_id": "ghost"})
     err = await client.wait_for(lambda e: e.get("type") == "blemeesd.error")
     assert err["code"] == "session_unknown"
+
+
+# ---------------------------------------------------------------------------
+# session_info
+# ---------------------------------------------------------------------------
+
+
+async def test_session_info_unknown_session_errors(client_factory):
+    client = await client_factory()
+    await client.send({"type": "blemeesd.session_info", "id": "i1", "session_id": "nope"})
+    err = await client.wait_for(lambda e: e.get("type") == "blemeesd.error")
+    assert err["code"] == "session_unknown"
+
+
+async def test_session_info_accumulates_across_turns(client_factory, fake_mode):
+    fake_mode("normal")
+    c = await client_factory()
+    await c.send({"type": "blemeesd.open", "id": "r1", "session_id": "u", "tools": ""})
+    await c.wait_for(lambda e: e.get("type") == "blemeesd.opened")
+
+    # Zero counters before any turn.
+    await c.send({"type": "blemeesd.session_info", "id": "i0", "session_id": "u"})
+    zero = await c.wait_for(lambda e: e.get("type") == "blemeesd.session_info_reply")
+    assert zero["turns"] == 0
+    assert zero["cumulative_usage"]["input_tokens"] == 0
+
+    # One turn (fake emits usage: in=10, out=5).
+    for i in range(3):
+        await c.send(
+            {
+                "type": "claude.user",
+                "session_id": "u",
+                "message": {"role": "user", "content": f"hi {i}"},
+            }
+        )
+        await c.wait_for(lambda e: e.get("type") == "claude.result" and e.get("session_id") == "u")
+
+    await c.send({"type": "blemeesd.session_info", "id": "i1", "session_id": "u"})
+    info = await c.wait_for(lambda e: e.get("type") == "blemeesd.session_info_reply")
+    assert info["turns"] == 3
+    assert info["cumulative_usage"]["input_tokens"] == 30
+    assert info["cumulative_usage"]["output_tokens"] == 15
+    assert info["last_turn_usage"]["input_tokens"] == 10
+    assert info["model"] == "claude-fake"
+    assert info["attached"] is True
+    assert info["subprocess_running"] is True
+    assert info["last_seq"] > 0
+
+
+async def test_session_info_survives_daemon_restart(tmp_path, monkeypatch):
+    """Usage persists across a daemon restart when event_log_dir is set."""
+    from blemees import PROTOCOL_VERSION
+    from blemees.config import Config
+    from blemees.daemon import Daemon
+    from blemees.logging import configure
+
+    fake = str(Path(__file__).parent / "fake_claude.py")
+    log_dir = tmp_path / "events"
+    monkeypatch.setenv("BLEMEES_FAKE_MODE", "normal")
+
+    def _cfg(sock: Path) -> Config:
+        return Config(
+            socket_path=str(sock),
+            claude_bin=fake,
+            idle_timeout_s=60,
+            max_concurrent_sessions=8,
+            event_log_dir=str(log_dir),
+        )
+
+    async def _connect(path: Path):
+        r, w = await asyncio.open_unix_connection(str(path))
+
+        async def send(frame):
+            w.write((json.dumps(frame) + "\n").encode())
+            await w.drain()
+
+        async def recv():
+            raw = await r.readuntil(b"\n")
+            return json.loads(raw.rstrip(b"\r\n").decode("utf-8"))
+
+        async def wait_for(pred, timeout=5.0):
+            deadline = asyncio.get_running_loop().time() + timeout
+            while True:
+                if asyncio.get_running_loop().time() > deadline:
+                    raise TimeoutError
+                evt = await asyncio.wait_for(recv(), timeout=1.5)
+                if pred(evt):
+                    return evt
+
+        await send(
+            {
+                "type": "blemeesd.hello",
+                "client": "t/0",
+                "protocol": PROTOCOL_VERSION,
+            }
+        )
+        await recv()  # hello_ack
+        return w, send, wait_for
+
+    # ----- first daemon: run two turns, confirm counters, shut down.
+    sock1 = tmp_path / "d1.sock"
+    cfg1 = _cfg(sock1)
+    d1 = Daemon(cfg1, configure("error"))
+    await d1.start()
+    t1 = asyncio.create_task(d1.serve_forever())
+    try:
+        w, send, wait_for = await _connect(sock1)
+        await send({"type": "blemeesd.open", "id": "r1", "session_id": "keep", "tools": ""})
+        await wait_for(lambda e: e.get("type") == "blemeesd.opened")
+        for _ in range(2):
+            await send(
+                {
+                    "type": "claude.user",
+                    "session_id": "keep",
+                    "message": {"role": "user", "content": "hi"},
+                }
+            )
+            await wait_for(
+                lambda e: e.get("type") == "claude.result" and e.get("session_id") == "keep"
+            )
+        w.close()
+        try:
+            await w.wait_closed()
+        except Exception:
+            pass
+    finally:
+        d1.request_shutdown()
+        await asyncio.wait_for(t1, timeout=5.0)
+
+    # Sidecar is on disk.
+    sidecar = log_dir / "keep.usage.json"
+    assert sidecar.is_file()
+
+    # ----- second daemon: reopen resume=true, query info, expect 2 turns.
+    sock2 = tmp_path / "d2.sock"
+    cfg2 = _cfg(sock2)
+    d2 = Daemon(cfg2, configure("error"))
+    await d2.start()
+    t2 = asyncio.create_task(d2.serve_forever())
+    try:
+        w, send, wait_for = await _connect(sock2)
+        await send(
+            {
+                "type": "blemeesd.open",
+                "id": "r2",
+                "session_id": "keep",
+                "resume": True,
+                "tools": "",
+            }
+        )
+        await wait_for(lambda e: e.get("type") == "blemeesd.opened")
+        await send({"type": "blemeesd.session_info", "id": "i1", "session_id": "keep"})
+        info = await wait_for(lambda e: e.get("type") == "blemeesd.session_info_reply")
+        assert info["turns"] == 2
+        assert info["cumulative_usage"]["input_tokens"] == 20
+        assert info["cumulative_usage"]["output_tokens"] == 10
+        w.close()
+        try:
+            await w.wait_closed()
+        except Exception:
+            pass
+    finally:
+        d2.request_shutdown()
+        await asyncio.wait_for(t2, timeout=5.0)

@@ -152,6 +152,12 @@ def main() -> int:
                     "subtype": "success",
                     "duration_ms": int(delay_s * 1000),
                     "num_turns": 1,
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 25,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
                 }
             )
             continue
@@ -179,6 +185,12 @@ def main() -> int:
                 "subtype": "success",
                 "duration_ms": 1,
                 "num_turns": 1,
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
             }
         )
 

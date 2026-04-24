@@ -148,6 +148,12 @@ class UnwatchMessage:
     session_id: str
 
 
+@dataclasses.dataclass(slots=True)
+class SessionInfoMessage:
+    id: str | None
+    session_id: str
+
+
 def parse_hello(obj: dict[str, Any]) -> HelloMessage:
     protocol = obj.get("protocol")
     if not isinstance(protocol, str):
@@ -338,6 +344,16 @@ def parse_unwatch(obj: dict[str, Any]) -> UnwatchMessage:
     if req_id is not None and not isinstance(req_id, str):
         raise ProtocolError("'id' must be a string")
     return UnwatchMessage(id=req_id, session_id=session_id)
+
+
+def parse_session_info(obj: dict[str, Any]) -> SessionInfoMessage:
+    session_id = obj.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        raise ProtocolError("session_info requires 'session_id'")
+    req_id = obj.get("id")
+    if req_id is not None and not isinstance(req_id, str):
+        raise ProtocolError("'id' must be a string")
+    return SessionInfoMessage(id=req_id, session_id=session_id)
 
 
 # ---------------------------------------------------------------------------

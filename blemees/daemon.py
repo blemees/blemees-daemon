@@ -57,6 +57,7 @@ from .protocol import (
     parse_line,
     parse_list_sessions,
     parse_open,
+    parse_session_info,
     parse_unwatch,
     parse_user,
     parse_watch,
@@ -276,6 +277,8 @@ class Connection:
                 await self._handle_watch(parse_watch(obj))
             elif msg_type == "blemeesd.unwatch":
                 await self._handle_unwatch(parse_unwatch(obj))
+            elif msg_type == "blemeesd.session_info":
+                await self._handle_session_info(parse_session_info(obj))
             elif msg_type == "blemeesd.hello":
                 await self._emit_error(INVALID_MESSAGE, "duplicate hello", id=obj.get("id"))
             else:
@@ -526,6 +529,30 @@ class Connection:
                 "was_watching": removed,
             }
         )
+
+    async def _handle_session_info(self, msg) -> None:
+        """Reply with the session's cumulative usage + per-turn snapshot.
+
+        No side effects. Persists across daemon restarts when the durable
+        event log is enabled (sidecar at ``<log_dir>/<session>.usage.json``).
+        """
+        sess = self._sessions.try_get(msg.session_id)
+        if sess is None:
+            await self._emit_error(
+                SESSION_UNKNOWN,
+                f"no such session: {msg.session_id}",
+                id=msg.id,
+                session_id=msg.session_id,
+            )
+            return
+        subproc_running = sess.subprocess is not None and sess.subprocess.running
+        snap = sess.usage_snapshot(
+            attached=sess.connection_id is not None,
+            subprocess_running=subproc_running,
+        )
+        frame: dict[str, Any] = {"type": "blemeesd.session_info_reply", "id": msg.id}
+        frame.update(snap)
+        await self._emit_frame(frame)
 
     # ------------------------------------------------------------------
     # Writer side

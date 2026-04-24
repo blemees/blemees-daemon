@@ -22,6 +22,7 @@ reconnect and catch up across disconnects or daemon restarts.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -58,6 +59,23 @@ class Session:
     # but cannot drive the session (user/interrupt/close).
     _watchers: dict[int, WriterFn] = field(default_factory=dict)
 
+    # Running usage accumulator maintained from claude.result frames. Persists
+    # to <event_log_dir>/<session>.usage.json so it survives daemon restarts
+    # whenever the durable log is enabled.
+    turns: int = 0
+    last_model: str | None = None
+    last_turn_at_ms: int | None = None
+    last_turn_usage: dict[str, int] = field(default_factory=dict)
+    cumulative_usage: dict[str, int] = field(
+        default_factory=lambda: {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+        }
+    )
+    _usage_path: Path | None = None
+
     extra: dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
@@ -79,6 +97,8 @@ class Session:
                 self.log.append(frame)
             except OSError:
                 pass  # disk issue; the ring still has it.
+        # Maintain usage / turn counters from CC native events.
+        self._update_usage_from_frame(frame)
         writer = self._writer
         if writer is not None:
             try:
@@ -215,7 +235,11 @@ class Session:
     # ------------------------------------------------------------------
 
     def enable_durable_log(self, base_dir: Path | str) -> None:
-        """Attach a durable log; seed the ring from the tail of any prior file."""
+        """Attach a durable log; seed the ring from the tail of any prior file.
+
+        Also loads a ``<session>.usage.json`` sidecar next to the log so
+        the cumulative usage accumulator survives daemon restarts.
+        """
         path = event_log_path(base_dir, self.session_id)
         log = DurableEventLog(path)
         # Seed from tail so we can replay across a daemon restart.
@@ -230,6 +254,105 @@ class Session:
                 self.seq = latest
         log.open()
         self.log = log
+        self._usage_path = Path(base_dir) / f"{self.session_id}.usage.json"
+        self._load_usage_sidecar()
+
+    # ------------------------------------------------------------------
+    # Usage accumulator
+    # ------------------------------------------------------------------
+
+    def _update_usage_from_frame(self, frame: dict) -> None:
+        """Pull model / usage out of relevant CC events. Persist if enabled."""
+        t = frame.get("type")
+        if t == "claude.system" and frame.get("subtype") == "init":
+            model = frame.get("model")
+            if isinstance(model, str):
+                self.last_model = model
+            return
+        if t != "claude.result":
+            return
+        usage = frame.get("usage")
+        if not isinstance(usage, dict):
+            return
+        # Snapshot last-turn usage verbatim so clients see whatever fields CC
+        # emits (including future ones we don't know about yet).
+        self.last_turn_usage = dict(usage)
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ):
+            self.cumulative_usage[key] = self.cumulative_usage.get(key, 0) + int(
+                usage.get(key, 0) or 0
+            )
+        self.turns += 1
+        self.last_turn_at_ms = int(time.time() * 1000)
+        self._save_usage_sidecar()
+
+    def usage_snapshot(self, *, attached: bool, subprocess_running: bool) -> dict:
+        """Build the payload for a ``blemeesd.session_info_reply`` frame."""
+        last_inputs = (
+            int(self.last_turn_usage.get("input_tokens", 0) or 0)
+            + int(self.last_turn_usage.get("cache_read_input_tokens", 0) or 0)
+            + int(self.last_turn_usage.get("cache_creation_input_tokens", 0) or 0)
+        )
+        return {
+            "session_id": self.session_id,
+            "model": self.last_model,
+            "cwd": self.cwd,
+            "turns": self.turns,
+            "last_turn_at_ms": self.last_turn_at_ms,
+            "last_turn_usage": dict(self.last_turn_usage),
+            "cumulative_usage": dict(self.cumulative_usage),
+            "context_tokens": last_inputs,
+            "attached": attached,
+            "subprocess_running": subprocess_running,
+            # Highest seq the session has produced to date — mirrors the
+            # ``last_seq`` field on ``blemeesd.opened`` / ``blemeesd.watching``.
+            "last_seq": self.seq,
+        }
+
+    def _save_usage_sidecar(self) -> None:
+        if self._usage_path is None:
+            return
+        payload = {
+            "session_id": self.session_id,
+            "model": self.last_model,
+            "turns": self.turns,
+            "last_turn_at_ms": self.last_turn_at_ms,
+            "last_turn_usage": self.last_turn_usage,
+            "cumulative_usage": self.cumulative_usage,
+        }
+        try:
+            self._usage_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._usage_path.with_suffix(".usage.json.tmp")
+            tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+            tmp.replace(self._usage_path)
+        except OSError:
+            pass  # best-effort; ring + in-memory accumulator remain authoritative.
+
+    def _load_usage_sidecar(self) -> None:
+        if self._usage_path is None or not self._usage_path.is_file():
+            return
+        try:
+            data = json.loads(self._usage_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict):
+            return
+        if isinstance(data.get("model"), str):
+            self.last_model = data["model"]
+        if isinstance(data.get("turns"), int):
+            self.turns = data["turns"]
+        if isinstance(data.get("last_turn_at_ms"), int):
+            self.last_turn_at_ms = data["last_turn_at_ms"]
+        if isinstance(data.get("last_turn_usage"), dict):
+            self.last_turn_usage = dict(data["last_turn_usage"])
+        if isinstance(data.get("cumulative_usage"), dict):
+            for k, v in data["cumulative_usage"].items():
+                if isinstance(v, int):
+                    self.cumulative_usage[k] = v
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +481,13 @@ class SessionTable:
                     path.unlink()
             except OSError:
                 pass
+            # Remove the usage sidecar alongside the log + transcript.
+            if sess._usage_path is not None:
+                try:
+                    if sess._usage_path.is_file():
+                        sess._usage_path.unlink()
+                except OSError:
+                    pass
 
     # ------------------------------------------------------------------
     # Idle reaper

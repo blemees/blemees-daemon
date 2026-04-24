@@ -612,6 +612,49 @@ Reply:
 ```
 Watchers are also automatically removed when the connection closes.
 
+### 5.15 Session info (usage + turn counters)
+
+Query a session's cumulative token usage, turn count, and last-turn
+snapshot. Side-effect-free.
+
+Client:
+```json
+{"type":"blemeesd.session_info","id":"req_5","session_id":"s_abc"}
+```
+Daemon:
+```json
+{
+  "type":"blemeesd.session_info_reply","id":"req_5","session_id":"s_abc",
+  "model":"claude-sonnet-4-6","cwd":"/home/u/proj",
+  "turns":5,
+  "last_turn_at_ms":1745000000000,
+  "last_turn_usage":{
+    "input_tokens":500,"output_tokens":200,
+    "cache_read_input_tokens":14000,"cache_creation_input_tokens":0
+  },
+  "cumulative_usage":{
+    "input_tokens":3000,"output_tokens":1200,
+    "cache_read_input_tokens":70000,"cache_creation_input_tokens":100
+  },
+  "context_tokens":14500,
+  "attached":true,"subprocess_running":true,
+  "last_seq":42
+}
+```
+
+The accumulator is maintained from each `claude.result` event's
+`usage` block (fields pass through verbatim; future Anthropic-added
+keys appear automatically). `context_tokens` is the sum of the last
+turn's input-side tokens (fresh + `cache_read` + `cache_creation`)
+— compare to the model's context window to gauge headroom.
+
+**Persistence**: when `event_log_dir` is enabled, the counters are
+written to `<event_log_dir>/<session>.usage.json` on every turn
+(atomic rename) and reloaded on session reopen, so they survive
+daemon restarts. Without the durable log they are in-memory only and
+reset to zero on restart. `blemeesd.close {delete:true}` also
+unlinks the sidecar.
+
 ---
 
 ## 6. Subprocess Management
@@ -958,6 +1001,7 @@ All originally-reserved verbs are now implemented and live on `blemees/1`:
 - `blemeesd.status` / `blemeesd.status_reply` — daemon introspection. See §5.13.
 - `blemeesd.list_sessions` / `blemeesd.sessions` — enumerate. See §5.5 list_sessions note.
 - `blemeesd.watch` / `blemeesd.watching` / `blemeesd.unwatch` / `blemeesd.unwatched` — subscribe-only observer stream. See §5.14.
+- `blemeesd.session_info` / `blemeesd.session_info_reply` — per-session usage + turn counters (persisted to a sidecar when the durable event log is on). See §5.15.
 
 Future additions may re-reserve names; the daemon's `_RESERVED_TYPES`
 set is kept in code so unimplemented-but-reserved verbs get a deterministic
