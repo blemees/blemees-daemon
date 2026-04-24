@@ -1037,19 +1037,6 @@ Acceptance targets on an ordinary dev machine:
 
 ---
 
-## 13. Out of Scope (v0.1)
-
-- Remote TCP/TLS access (use SSH forwarding).
-- Windows support.
-- Metrics endpoint (prometheus etc.).
-- GUI/admin interface.
-- Warm subprocess pool (future optimization).
-- Passing/rewriting the OAuth token. Clients inherit whatever the daemon
-  process has.
-- Automatic `claude` binary updates.
-
----
-
 ## Appendix A: Reference client example
 
 ```python
