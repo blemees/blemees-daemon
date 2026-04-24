@@ -667,6 +667,12 @@ class Connection:
         """Emit a daemon_shutdown error on this connection."""
         await self._send_error_sync(DAEMON_SHUTDOWN, "daemon shutting down")
         self._alive = False
+        # Close the transport so that any in-progress readuntil() in
+        # _read_loop() receives an EOF / ConnectionError and returns
+        # immediately, allowing serve() to finish and server.wait_closed()
+        # to resolve.
+        with contextlib.suppress(Exception):
+            self._writer.close()
 
     async def notify_session_taken(self, session_id: str, *, by_peer_pid: int | None) -> None:
         """Inform this connection that another connection has taken over a session.
@@ -781,8 +787,7 @@ class Daemon:
     async def serve_forever(self) -> None:
         assert self._server is not None
         try:
-            async with self._server:
-                await self._shutdown_event.wait()
+            await self._shutdown_event.wait()
         finally:
             await self._shutdown()
 
@@ -793,13 +798,22 @@ class Daemon:
     async def _shutdown(self) -> None:
         if self._server is not None:
             self._server.close()
-            with contextlib.suppress(Exception):
-                await self._server.wait_closed()
 
-        # Notify live connections.
+        # Notify live connections and close their transports so that any
+        # pending readuntil() calls unblock immediately.  This must happen
+        # before server.wait_closed(), because wait_closed() in Python 3.12+
+        # waits for *all* active _on_client callbacks to return, and those
+        # callbacks are blocked in _read_loop until the transport is closed.
         for conn in list(self._connections):
             with contextlib.suppress(Exception):
                 await conn.broadcast_shutdown()
+
+        # Wait for all _on_client callbacks to finish now that connections
+        # have been told to close.  Use a short timeout so a stuck connection
+        # can't prevent the rest of the shutdown sequence from running.
+        if self._server is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._server.wait_closed(), timeout=_SHUTDOWN_BUDGET_S)
 
         # Graceful phase: let sessions with an in-flight turn run to the next
         # claude.result so their transcript closes cleanly. Same soft-detach
