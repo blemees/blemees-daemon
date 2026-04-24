@@ -35,7 +35,7 @@ from .errors import (
     SPAWN_FAILED,
     UNKNOWN_MESSAGE,
     UNSAFE_FLAG,
-    CcsockError,
+    BlemeesError,
     OversizeMessageError,
     ProtocolError,
     SessionBusyError,
@@ -296,7 +296,7 @@ class Connection:
             await self._emit_error(UNSAFE_FLAG, exc.message, id=obj.get("id"))
         except ProtocolError as exc:
             await self._emit_error(INVALID_MESSAGE, exc.message, id=obj.get("id"))
-        except CcsockError as exc:
+        except BlemeesError as exc:
             await self._emit_error(
                 exc.code, exc.message, id=obj.get("id"), session_id=obj.get("session_id")
             )

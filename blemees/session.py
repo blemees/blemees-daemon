@@ -150,35 +150,42 @@ class Session:
 
         to_replay = self.ring.since(last_seen_seq)
         earliest = self.ring.earliest_seq()
+
+        # Replay available frames first so the client sees them before the gap notice.
+        for frame in to_replay:
+            await writer(frame)
+        summary["replayed"] = len(to_replay)
+
+        # After replaying, notify about any gap with a properly sequenced frame.
         if earliest is not None and earliest > last_seen_seq + 1:
-            # We dropped frames with seq in (last_seen_seq, earliest).
+            # Frames with seq in (last_seen_seq, earliest) were dropped from the ring.
+            self.seq += 1
             await writer(
                 {
                     "type": "blemeesd.replay_gap",
                     "session_id": self.session_id,
                     "since_seq": last_seen_seq,
                     "first_available_seq": earliest,
-                    "seq": None,  # informational, not part of the seq stream
+                    "seq": self.seq,
                 }
             )
             summary["gap_from"] = last_seen_seq + 1
             summary["gap_to"] = earliest - 1
         elif not to_replay and self.seq > last_seen_seq:
+            # Ring has rolled past last_seen_seq with nothing to replay.
+            old_seq = self.seq
+            self.seq += 1
             await writer(
                 {
                     "type": "blemeesd.replay_gap",
                     "session_id": self.session_id,
                     "since_seq": last_seen_seq,
                     "first_available_seq": self.seq + 1,
-                    "seq": None,
+                    "seq": self.seq,
                 }
             )
             summary["gap_from"] = last_seen_seq + 1
-            summary["gap_to"] = self.seq
-
-        for frame in to_replay:
-            await writer(frame)
-        summary["replayed"] = len(to_replay)
+            summary["gap_to"] = old_seq
         return summary
 
     def detach_writer(self) -> None:
@@ -210,20 +217,23 @@ class Session:
             return summary
         to_replay = self.ring.since(last_seen_seq)
         earliest = self.ring.earliest_seq()
+        # Replay available frames first, then notify about any gap.
+        for frame in to_replay:
+            await writer(frame)
+        summary["replayed"] = len(to_replay)
         if earliest is not None and earliest > last_seen_seq + 1:
+            self.seq += 1
             await writer(
                 {
                     "type": "blemeesd.replay_gap",
                     "session_id": self.session_id,
                     "since_seq": last_seen_seq,
                     "first_available_seq": earliest,
+                    "seq": self.seq,
                 }
             )
             summary["gap_from"] = last_seen_seq + 1
             summary["gap_to"] = earliest - 1
-        for frame in to_replay:
-            await writer(frame)
-        summary["replayed"] = len(to_replay)
         return summary
 
     def remove_watcher(self, connection_id: int) -> bool:

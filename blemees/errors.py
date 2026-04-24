@@ -34,7 +34,7 @@ FATAL_CODES = frozenset(
 )
 
 
-class CcsockError(Exception):
+class BlemeesError(Exception):
     """Base exception carrying a machine-readable error code."""
 
     def __init__(self, code: str, message: str) -> None:
@@ -47,41 +47,45 @@ class CcsockError(Exception):
         return self.code in FATAL_CODES
 
 
-class ProtocolError(CcsockError):
+# Backward-compatible alias kept for any external code that imported the old name.
+CcsockError = BlemeesError
+
+
+class ProtocolError(BlemeesError):
     def __init__(self, message: str, code: str = INVALID_MESSAGE) -> None:
         super().__init__(code, message)
 
 
-class UnsafeFlagError(CcsockError):
+class UnsafeFlagError(BlemeesError):
     def __init__(self, flag: str) -> None:
         super().__init__(UNSAFE_FLAG, f"refused flag: {flag}")
         self.flag = flag
 
 
-class SessionUnknownError(CcsockError):
+class SessionUnknownError(BlemeesError):
     def __init__(self, session: str) -> None:
         super().__init__(SESSION_UNKNOWN, f"no such session: {session}")
         self.session = session
 
 
-class SessionExistsError(CcsockError):
+class SessionExistsError(BlemeesError):
     def __init__(self, session: str) -> None:
         super().__init__(SESSION_EXISTS, f"session already open: {session}")
         self.session = session
 
 
-class SessionBusyError(CcsockError):
+class SessionBusyError(BlemeesError):
     def __init__(self, session: str) -> None:
         super().__init__(SESSION_BUSY, f"session has a turn in flight: {session}")
         self.session = session
 
 
-class SpawnFailedError(CcsockError):
+class SpawnFailedError(BlemeesError):
     def __init__(self, message: str) -> None:
         super().__init__(SPAWN_FAILED, message)
 
 
-class OversizeMessageError(CcsockError):
+class OversizeMessageError(BlemeesError):
     def __init__(self, limit: int) -> None:
         super().__init__(OVERSIZE_MESSAGE, f"frame exceeds {limit} bytes")
         self.limit = limit

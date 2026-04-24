@@ -119,9 +119,10 @@ async def test_session_emits_replay_gap_when_ring_rolled_over():
         seen.append(frame)
 
     summary = await sess.attach(connection_id=3, writer=writer, last_seen_seq=2)
-    assert seen[0]["type"] == "blemeesd.replay_gap"
-    assert seen[0]["first_available_seq"] == 8
-    assert [f["seq"] for f in seen[1:]] == [8, 9, 10]
+    assert [f["seq"] for f in seen[:3]] == [8, 9, 10]
+    assert seen[3]["type"] == "blemeesd.replay_gap"
+    assert seen[3]["first_available_seq"] == 8
+    assert seen[3]["seq"] == 11
     assert summary["gap_from"] == 3 and summary["gap_to"] == 7
 
 
