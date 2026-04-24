@@ -11,16 +11,34 @@ Machine-readable JSON Schemas live under [`schemas/`](schemas/).
 
 ## 0. Install
 
-```bash
-# From source (editable, for development):
-pip install -e ".[dev]"
+Python 3.11+. No runtime dependencies outside the standard library.
+The `claude` binary must be on `$PATH` (or pass `--claude`).
 
-# Minimal install:
-pip install .
+PyPI is the canonical source — every channel below pulls the same wheel
+from there.
+
+```bash
+# pip (any environment):
+pip install blemees
+
+# uv (isolated CLI tool, fast):
+uv tool install blemees
+
+# pipx (isolated CLI tool, classic):
+pipx install blemees
+
+# Homebrew (macOS / Linux):
+brew tap juanheyns/blemees
+brew install blemees
 ```
 
-Python 3.11+ is required. No runtime dependencies outside the standard
-library. The `claude` binary must be on `$PATH` (or pass `--claude`).
+From source for development:
+
+```bash
+git clone https://github.com/juanheyns/agent-daemon
+cd agent-daemon
+uv pip install -e ".[dev]"      # or: pip install -e ".[dev]"
+```
 
 Run in the foreground:
 
@@ -50,15 +68,14 @@ cp packaging/blemeesd/com.blemees.blemeesd.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.blemees.blemeesd.plist
 ```
 
-### Homebrew
+### `brew services` (after `brew install`)
 
 ```bash
-brew tap juanheyns/blemees
-brew install blemees
+brew services start blemees
 ```
 
-(See [`packaging/homebrew/`](packaging/homebrew/) for the formula and the
-tap-setup instructions.)
+The Homebrew formula ships a service stanza so the daemon runs at login
+without you touching launchd by hand.
 
 ---
 
