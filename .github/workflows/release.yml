@@ -49,10 +49,6 @@ jobs:
   publish-pypi:
     name: Publish to PyPI (Trusted Publishers)
     needs: build
-    # Flip this guard to `true` after you configure a PyPI trusted publisher
-    # for this repository. Until then the job no-ops so pushing a tag doesn't
-    # require PyPI credentials.
-    if: ${{ false }}
     runs-on: ubuntu-latest
     environment:
       name: pypi
