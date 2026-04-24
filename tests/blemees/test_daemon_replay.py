@@ -23,8 +23,10 @@ pytestmark = pytest.mark.asyncio
 def _make_config(
     tmp_path: Path, *, event_log_dir: Path | None = None, ring_buffer_size: int = 1024
 ) -> Config:
+    from tests.blemees.conftest import short_socket_path
+
     return Config(
-        socket_path=str(tmp_path / "blemeesd.sock"),
+        socket_path=str(short_socket_path("blemeesd-replay")),
         claude_bin=FAKE_CLAUDE,
         idle_timeout_s=60,
         max_concurrent_sessions=8,
@@ -347,8 +349,10 @@ async def test_event_log_survives_restart(tmp_path, monkeypatch):
     assert seqs == sorted(seqs)
 
     # Second daemon starts fresh, sees the log, can replay into a new client.
+    from tests.blemees.conftest import short_socket_path
+
     cfg2 = _make_config(tmp_path, event_log_dir=log_dir)
-    cfg2.socket_path = str(tmp_path / "blemeesd-2.sock")
+    cfg2.socket_path = str(short_socket_path("blemeesd-replay2"))
     d2 = Daemon(cfg2, logger)
     await d2.start()
     t2 = asyncio.create_task(d2.serve_forever())

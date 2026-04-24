@@ -21,8 +21,10 @@ pytestmark = pytest.mark.asyncio
 
 
 def _config(tmp_path: Path, *, grace_s: int) -> Config:
+    from tests.blemees.conftest import short_socket_path
+
     return Config(
-        socket_path=str(tmp_path / "blemeesd.sock"),
+        socket_path=str(short_socket_path("blemeesd-shutdown")),
         claude_bin=FAKE_CLAUDE,
         idle_timeout_s=60,
         max_concurrent_sessions=8,

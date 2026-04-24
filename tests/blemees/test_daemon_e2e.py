@@ -36,7 +36,9 @@ _need_claude()
 
 @pytest_asyncio.fixture
 async def real_daemon(tmp_path):
-    socket_path = tmp_path / "blemeesd.sock"
+    from tests.blemees.conftest import short_socket_path
+
+    socket_path = short_socket_path("blemeesd-e2e")
     cfg = Config(socket_path=str(socket_path), claude_bin=CLAUDE)
     logger = configure("error")
     daemon = Daemon(cfg, logger)

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
+import secrets
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +21,30 @@ from blemees.daemon import Daemon
 from blemees.logging import configure
 
 FAKE_CLAUDE = Path(__file__).parent / "fake_claude.py"
+
+
+def short_socket_path(name: str = "blemeesd") -> Path:
+    """Return a short-ish Unix-socket path.
+
+    macOS's ``sun_path`` is 104 bytes (Linux is 108). pytest's ``tmp_path`` on
+    macOS CI lives under ``/Users/runner/work/_temp/pytest-of-runner/...``,
+    which routinely overflows that limit when a session id / subdir is
+    appended. We bind sockets under the system temp dir (e.g. ``/tmp``)
+    with an 8-char random suffix so the full path stays well under 104.
+    """
+    tag = secrets.token_hex(4)
+    return Path(tempfile.gettempdir()) / f"{name}-{tag}.sock"
+
+
+@contextlib.contextmanager
+def socket_cleanup(path: Path):
+    """Best-effort unlink of a socket path after the test, if the daemon
+    crashed before its own _prepare_socket_path unlink fired."""
+    try:
+        yield path
+    finally:
+        with contextlib.suppress(FileNotFoundError, OSError):
+            path.unlink()
 
 
 @pytest.fixture
@@ -54,7 +81,9 @@ async def daemon_and_socket(tmp_path, argv_trace_path, monkeypatch, request):
     monkeypatch.setenv("BLEMEES_FAKE_ARGV_FILE", str(argv_trace_path))
     monkeypatch.setenv("BLEMEES_FAKE_MODE", os.environ.get("BLEMEES_FAKE_MODE", "normal"))
 
-    socket_path = tmp_path / "blemeesd.sock"
+    # macOS sun_path is 104 bytes; pytest's tmp_path on macOS CI overflows
+    # that limit for nested socket files. Bind under /tmp instead.
+    socket_path = short_socket_path("blemeesd-test")
     overrides = getattr(request, "param", None) or {}
     cfg = Config(
         socket_path=str(socket_path),

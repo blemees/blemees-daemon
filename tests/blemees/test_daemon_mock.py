@@ -675,8 +675,10 @@ async def test_session_info_survives_daemon_restart(tmp_path, monkeypatch):
         await recv()  # hello_ack
         return w, send, wait_for
 
+    from tests.blemees.conftest import short_socket_path
+
     # ----- first daemon: run two turns, confirm counters, shut down.
-    sock1 = tmp_path / "d1.sock"
+    sock1 = short_socket_path("blemeesd-persist1")
     cfg1 = _cfg(sock1)
     d1 = Daemon(cfg1, configure("error"))
     await d1.start()
@@ -710,7 +712,7 @@ async def test_session_info_survives_daemon_restart(tmp_path, monkeypatch):
     assert sidecar.is_file()
 
     # ----- second daemon: reopen resume=true, query info, expect 2 turns.
-    sock2 = tmp_path / "d2.sock"
+    sock2 = short_socket_path("blemeesd-persist2")
     cfg2 = _cfg(sock2)
     d2 = Daemon(cfg2, configure("error"))
     await d2.start()
