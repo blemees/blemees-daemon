@@ -5,13 +5,9 @@ class Blemees < Formula
   homepage "https://github.com/blemees/blemees-daemon"
   license "MIT"
 
-  # HEAD-only until the first versioned release artifact is published.
-  # Install with:  brew install --HEAD blemees
-  #
-  # On release, replace this block with the versioned tarball:
-  #   url "https://github.com/blemees/blemees-daemon/archive/refs/tags/vX.Y.Z.tar.gz"
-  #   sha256 "<output of: shasum -a 256 <tarball>>"
-  #   version "X.Y.Z"
+  url "https://github.com/blemees/blemees-daemon/archive/refs/tags/v0.1.0.tar.gz"
+  sha256 "a5fadce5ee03549dfbd2a628027e58741b02907f60238a5a9d973f595a8e3ecf"
+  version "0.1.0"
   head "https://github.com/blemees/blemees-daemon.git", branch: "main"
 
   # Runtime: stdlib-only; we just need a working Python.
