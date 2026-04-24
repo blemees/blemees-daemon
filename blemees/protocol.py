@@ -231,7 +231,7 @@ FIXED_FLAG_FIELDS: frozenset[str] = frozenset({"input_format", "output_format"})
 def parse_open(obj: dict[str, Any]) -> OpenMessage:
     session_id = obj.get("session_id")
     if not isinstance(session_id, str) or not session_id:
-        raise ProtocolError("open requires non-empty 'session'")
+        raise ProtocolError("open requires non-empty 'session_id'")
     resume = bool(obj.get("resume", False))
 
     # Refuse explicit unsafe flag keys.
