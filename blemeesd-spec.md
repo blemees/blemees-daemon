@@ -345,12 +345,31 @@ Daemon replies:
 ### 5.9 Connection close
 
 When the socket is closed from the client side without explicit `close`
-messages:
-1. Subprocesses for this connection are SIGTERM'd (500 ms grace → SIGKILL).
-2. Sessions are **detached**, not deleted. They are reapable after
-   `IDLE_TIMEOUT`.
-3. A new connection may reattach by opening the same `session` with
-   `resume: true`.
+messages (soft detach):
+
+1. The writer attached to each session is unhooked immediately so no more
+   frames are pushed to the dead socket.
+2. **If a turn is in flight**, the subprocess is *not* killed — it keeps
+   running to completion and the session is marked "finishing". Events
+   continue to accumulate in the session's ring buffer (§5.11) and in
+   the durable log if enabled, so a client that reconnects can replay
+   them via `last_seen_seq`. When the subprocess next emits
+   `claude.result`, the daemon gracefully terminates it.
+3. **If no turn is in flight**, the subprocess is terminated immediately
+   (SIGTERM → 500 ms → SIGKILL).
+4. Either way, the session record is *detached*, not deleted:
+   `connection_id = None`, `detached_at = now()`. It is reapable after
+   `IDLE_TIMEOUT` (during which a late-finishing turn will be torn down
+   along with the session).
+5. A new connection may reattach by opening the same `session` with
+   `resume: true`, optionally passing `last_seen_seq` to catch up on
+   anything it missed while disconnected.
+
+Rationale: a hard kill mid-turn left Claude Code's on-disk transcript in
+whatever partially-flushed state the SIGTERM grace allowed, silently
+diverging the model's conversation state from what the client last saw.
+Letting the turn complete closes the transcript cleanly and makes mid-
+stream reconnects a replay problem, not a consistency problem.
 
 ### 5.10 Errors
 
@@ -379,6 +398,48 @@ Error codes the client must handle:
 | `slow_consumer` | Per-connection queue stalled. | Yes. |
 | `daemon_shutdown` | Daemon shutting down. | Yes. |
 | `internal` | Unexpected daemon error. | No. |
+
+### 5.11 Event stream durability (seq, ring buffer, replay)
+
+Every outbound frame the daemon emits for a session — both forwarded
+`claude.*` events and synthetic `blemeesd.*` frames — carries a
+monotonic integer `seq`, assigned by the session and starting at 1.
+`blemeesd.opened` additionally carries `last_seq` so a reconnecting
+client knows the highest seq the session has produced.
+
+Recent frames are retained in two places:
+
+* **In-memory ring buffer**, per session, bounded (default 1024;
+  `BLEMEESD_RING_BUFFER_SIZE`). Always on. Survives client disconnects
+  but not daemon restarts.
+* **Durable event log**, per session, opt-in
+  (`BLEMEESD_EVENT_LOG_DIR`). Append-only JSONL at
+  `<dir>/<session>.jsonl`. On session reopen the ring is seeded from
+  the log's tail, so replay survives daemon restarts. `close
+  {delete:true}` unlinks the log.
+
+On reconnect, the client may request replay:
+
+```json
+{"type":"blemeesd.open","id":"r1","session":"s1","resume":true,"last_seen_seq":42}
+```
+
+The daemon delivers, in order:
+1. `blemeesd.opened` (with `last_seq`), then
+2. every buffered frame with `seq > last_seen_seq`, then
+3. live frames.
+
+If the buffer has rolled over past `last_seen_seq + 1`, a one-shot
+`blemeesd.replay_gap{since_seq, first_available_seq}` frame is emitted
+before the replay so the client can detect the loss:
+
+```json
+{"type":"blemeesd.replay_gap","session":"s1","since_seq":42,"first_available_seq":71}
+```
+
+Omitting `last_seen_seq` on reattach replays whatever is currently in
+the ring. Passing `last_seen_seq` equal to the session's current `seq`
+skips replay and goes straight to live delivery.
 
 ---
 
