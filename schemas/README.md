@@ -1,7 +1,7 @@
 # blemees — wire-frame JSON Schemas
 
 Machine-readable contract for every frame on the `blemees/1` protocol.
-The prose spec is `blemeesd-spec.md`; the schemas in this directory
+The prose spec is the repository root `README.md`; the schemas in this directory
 formalize the frame shapes referenced there.
 
 ## Layout

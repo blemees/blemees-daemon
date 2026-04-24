@@ -1,9 +1,64 @@
 # blemeesd — Headless Claude Code Daemon
 
-**Version:** 0.1 (draft, pre-implementation)
-**Status:** Ready for an implementing agent to build from zero.
+**Version:** 0.1
 **Language:** Python 3.11+, stdlib only (no runtime deps). Type-hinted.
-**Target OS:** Linux, macOS. Windows not supported in v0.1.
+**Target OS:** Linux, macOS. Windows not supported.
+
+This document is both the README and the authoritative protocol spec.
+Machine-readable JSON Schemas live under [`schemas/`](schemas/).
+
+---
+
+## 0. Install
+
+```bash
+# From source (editable, for development):
+pip install -e ".[dev]"
+
+# Minimal install:
+pip install .
+```
+
+Python 3.11+ is required. No runtime dependencies outside the standard
+library. The `claude` binary must be on `$PATH` (or pass `--claude`).
+
+Run in the foreground:
+
+```bash
+blemeesd                          # socket at $XDG_RUNTIME_DIR/blemeesd.sock
+blemeesd --socket /tmp/blemeesd.sock
+blemeesd --log-level debug
+```
+
+Socket permissions are `0600`. Anyone who can `connect()` the socket has
+full access to your Claude subscription, so guard it like an SSH agent.
+
+### systemd (Linux user unit)
+
+```bash
+mkdir -p ~/.config/systemd/user/
+cp packaging/blemeesd/blemeesd.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now blemeesd
+journalctl --user -u blemeesd -f
+```
+
+### launchd (macOS)
+
+```bash
+cp packaging/blemeesd/com.blemees.blemeesd.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.blemees.blemeesd.plist
+```
+
+### Homebrew
+
+```bash
+brew tap juanheyns/blemees
+brew install blemees
+```
+
+(See [`packaging/homebrew/`](packaging/homebrew/) for the formula and the
+tap-setup instructions.)
 
 ---
 
@@ -824,21 +879,21 @@ These mirror the Hermes spike numbers (0.98 s cold, ~0.8 s resume).
 
 ## 14. Deliverables Checklist
 
-- [ ] `blemees/` package per §4.
-- [ ] `blemeesd` console script in `pyproject.toml`.
-- [ ] Full wire protocol per §5.
-- [ ] Subprocess manager per §6.
-- [ ] Unit + mock tests per §11.1–11.2.
-- [ ] E2E tests per §11.3, gated by `requires_claude`.
-- [ ] systemd unit + launchd plist in `packaging/blemeesd/`.
-- [ ] `blemees/README.md`: install, protocol summary, worked client example
-      (Appendix A).
-- [ ] Reference client `blemees/client.py` (≤200 lines, stdlib only) with:
+- [x] `blemees/` package per §4.
+- [x] `blemeesd` console script in `pyproject.toml`.
+- [x] Full wire protocol per §5.
+- [x] Subprocess manager per §6.
+- [x] Unit + mock tests per §11.1–11.2.
+- [x] E2E tests per §11.3, gated by `requires_claude`.
+- [x] systemd unit + launchd plist in `packaging/blemeesd/`.
+- [x] `README.md` (this file): install, protocol, worked client example.
+- [x] Reference client `blemees/client.py` (stdlib only) with:
       `async with BlemeesClient.connect() as c`,
-      `async with c.open_session(**kwargs) as sess`,
-      `await sess.send_user(text | content=[...])`,
+      `async with c.open_session(session_id=..., **kwargs) as sess`,
+      `await sess.send_user(text | content=[...] | message={...})`,
       `async for event in sess.events()`,
       `await sess.interrupt()`.
+- [x] JSON Schemas under `schemas/` as the machine-readable contract.
 
 ---
 
