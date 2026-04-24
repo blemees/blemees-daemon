@@ -198,12 +198,16 @@ _OPEN_VALID_FIELDS = {
     "fallback_model",
     "session_name",
     "session_persistence",
-    "input_format",
-    "output_format",
     "include_partial_messages",
     "replay_user_messages",
     "type",
 }
+
+
+# Fields the daemon owns and refuses to accept from clients. These are part
+# of the daemon's contract with ``claude -p`` — overriding them would break
+# the event stream the daemon multiplexes.
+FIXED_FLAG_FIELDS: frozenset[str] = frozenset({"input_format", "output_format"})
 
 
 def parse_open(obj: dict[str, Any]) -> OpenMessage:
@@ -216,6 +220,15 @@ def parse_open(obj: dict[str, Any]) -> OpenMessage:
     for field in obj.keys():
         if field in UNSAFE_FLAG_FIELDS:
             raise UnsafeFlagError(field)
+
+    # Refuse daemon-owned flags. The stream-json format both ways is part of
+    # the daemon's contract with ``claude -p``; letting clients change it
+    # would break the event multiplexing.
+    for field in obj.keys():
+        if field in FIXED_FLAG_FIELDS:
+            raise ProtocolError(
+                f"{field!r} is not client-settable; daemon always uses stream-json"
+            )
 
     # Refuse unsafe CLI literals accidentally smuggled through free-form fields.
     for literal in UNSAFE_LITERAL_FLAGS:
@@ -321,11 +334,11 @@ def build_claude_argv(
     else:
         argv += ["--session-id", open_msg.session]
 
-    # Format flags default to stream-json both ways unless the client overrode.
-    input_format = f.get("input_format", "stream-json")
-    output_format = f.get("output_format", "stream-json")
-    argv += ["--input-format", str(input_format)]
-    argv += ["--output-format", str(output_format)]
+    # stream-json both ways is fixed by the daemon — see FIXED_FLAG_FIELDS.
+    # The event multiplexer parses JSON lines off stdout and expects JSON
+    # input-format lines on stdin, so this is not a client-tunable knob.
+    argv += ["--input-format", "stream-json"]
+    argv += ["--output-format", "stream-json"]
 
     def add(flag: str, value: Any) -> None:
         argv.append(flag)

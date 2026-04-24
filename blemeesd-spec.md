@@ -182,8 +182,6 @@ letting Claude Code apply its defaults.
   "fallback_model": null,
   "session_name": null,
   "session_persistence": true,
-  "input_format": "stream-json",
-  "output_format": "stream-json",
   "include_partial_messages": true,
   "replay_user_messages": false,
 
@@ -219,8 +217,6 @@ fields are omitted):
 | `fallback_model` | `--fallback-model <v>` |
 | `session_name` | `-n <v>` |
 | `session_persistence` | `--no-session-persistence` when `false` |
-| `input_format` | `--input-format <v>` (default: `stream-json`) |
-| `output_format` | `--output-format <v>` (default: `stream-json`) |
 | `include_partial_messages` | `--include-partial-messages` |
 | `replay_user_messages` | `--replay-user-messages` |
 | `session` + `resume:true` | `--resume <session>` |
@@ -238,6 +234,11 @@ explicitly — the daemon allows that, it just refuses the legacy kill switch.
 
 Daemon always enforces `--verbose` (required when `--output-format stream-json`
 is used with `-p`). Clients cannot override.
+
+Fields the daemon owns and refuses to accept from clients (rejected with
+`invalid_message` on open):
+`input_format`, `output_format`. Both are fixed to `stream-json`; the event
+multiplexer requires it, so they are not client-tunable knobs.
 
 Daemon reply on success:
 ```json
@@ -382,8 +383,8 @@ included:
 claude -p
   --verbose
   --session-id <s>    OR    --resume <s>
-  --input-format  <v>   # default stream-json
-  --output-format <v>   # default stream-json
+  --input-format  stream-json   # fixed by the daemon; not client-settable
+  --output-format stream-json   # fixed by the daemon; not client-settable
   [all other flags per §5.4 mapping, only when set]
 ```
 

@@ -139,6 +139,30 @@ def test_parse_open_rejects_unsafe_flag_literal_in_values():
         )
 
 
+def test_parse_open_rejects_client_set_input_format():
+    with pytest.raises(ProtocolError) as exc:
+        parse_open(
+            {
+                "type": "blemeesd.open",
+                "session": "s1",
+                "input_format": "text",
+            }
+        )
+    assert "input_format" in str(exc.value)
+
+
+def test_parse_open_rejects_client_set_output_format():
+    with pytest.raises(ProtocolError) as exc:
+        parse_open(
+            {
+                "type": "blemeesd.open",
+                "session": "s1",
+                "output_format": "json",
+            }
+        )
+    assert "output_format" in str(exc.value)
+
+
 def test_parse_open_allows_bypass_permissions_mode():
     # Explicitly allowed by spec §5.4.
     msg = parse_open(
@@ -210,8 +234,6 @@ def test_build_argv_maps_many_fields():
         "fallback_model": "haiku",
         "session_name": "pretty",
         "session_persistence": False,
-        "input_format": "stream-json",
-        "output_format": "stream-json",
         "include_partial_messages": True,
         "replay_user_messages": True,
     }
