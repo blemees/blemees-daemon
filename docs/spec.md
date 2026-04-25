@@ -85,6 +85,34 @@ brew services start blemees
 The Homebrew formula ships a service stanza so the daemon runs at login
 without you touching launchd by hand.
 
+### Smoke-test the wire (`blemees`)
+
+The package also ships `blemees`, an interactive REPL that maps each
+command to one outbound wire frame and prints every inbound frame. It's
+not a chat UI — it's how you poke the protocol, sanity-check an install,
+or reproduce a bug from a known sequence of frames.
+
+```
+$ blemees
+· connected: /tmp/blemeesd-501.sock
+→ {"type":"blemeesd.hello","client":"blemees-cli/0.1.0","protocol":"blemees/1"}
+← blemeesd.hello_ack  {"daemon":"blemeesd/0.1.0","claude_version":"…",…}
+blemees> status
+← blemeesd.status_reply  {"uptime_s":12.4,"connections":1,…}
+blemees> open new model=sonnet permission_mode=bypassPermissions
+· session_id: 5a01f0d8-…
+← blemeesd.opened  …
+blemees> send 5a01f0d8-… what is 2+2?
+← claude.stream_event …
+← claude.result {"subtype":"success","duration_ms":…}
+blemees> close 5a01f0d8-…
+```
+
+`help` at the prompt lists every verb. Highlights: `open` / `resume` /
+`close` / `interrupt` / `send` / `send-json` / `watch` / `unwatch` /
+`status` / `session-info` / `sessions <cwd>` / `ping`. `raw {…}` sends
+an arbitrary JSON frame for protocol experiments.
+
 ---
 
 ## 1. Overview
