@@ -58,7 +58,7 @@ If your change touches the wire protocol (any `claude.*` / `blemeesd.*`
 frame shape, session lifecycle, error codes), also update:
 
 - `README.md` §§ 3–9 (the spec lives here),
-- the matching JSON Schema under `schemas/`,
+- the matching JSON Schema under `blemees/schemas/`,
 - a test that exercises the new shape.
 
 Breaking protocol changes require a protocol-version bump (`blemees/1`

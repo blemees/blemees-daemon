@@ -13,7 +13,7 @@ on:
     branches: [main]
     paths:
       - "README.md"
-      - "schemas/README.md"
+      - "blemees/schemas/README.md"
       - ".github/workflows/docs-sync.yml"
   workflow_dispatch:
 
@@ -34,12 +34,12 @@ jobs:
             cat README.md
           } > docs/spec.md
 
-      - name: Re-generate docs/schemas.md from schemas/README.md
+      - name: Re-generate docs/schemas.md from blemees/schemas/README.md
         run: |
           {
             printf -- '---\ntitle: JSON Schemas\nnav_order: 3\npermalink: /schemas/\n---\n\n'
-            printf -- '<!-- Auto-synced from schemas/README.md by .github/workflows/docs-sync.yml. -->\n\n'
-            cat schemas/README.md
+            printf -- '<!-- Auto-synced from blemees/schemas/README.md by .github/workflows/docs-sync.yml. -->\n\n'
+            cat blemees/schemas/README.md
           } > docs/schemas.md
 
       - name: Commit changes (if any)
