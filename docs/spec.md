@@ -13,7 +13,7 @@ permalink: /spec/
 **Target OS:** Linux, macOS. Windows not supported.
 
 This document is both the README and the authoritative protocol spec.
-Machine-readable JSON Schemas live under [`schemas/`](schemas/).
+Machine-readable JSON Schemas live under [`blemees/schemas/`](blemees/schemas/) and ship inside the wheel — clients can resolve them via `importlib.resources.files("blemees.schemas")`.
 
 ---
 
@@ -222,9 +222,11 @@ script `blemeesd` in `pyproject.toml` maps to `python -m blemees`.
 ## 5. Wire Protocol
 
 Machine-readable JSON Schemas for every frame in this section live
-under `schemas/` (Draft 2020-12). See `schemas/README.md` for layout
-and usage. This prose is the human-facing spec; the schemas are the
-contract.
+under `blemees/schemas/` (Draft 2020-12) and ship as package data in
+the wheel. See `blemees/schemas/README.md` for layout and usage; the
+helpers `blemees.schemas.load(name)` and `iter_schemas()` give you a
+parsed schema or a stream of them without touching the filesystem.
+This prose is the human-facing spec; the schemas are the contract.
 
 ### 5.1 Framing
 
