@@ -1,26 +1,37 @@
 name: Bump Homebrew tap
 
-# Fires once a GitHub Release is published (the release.yml workflow
-# publishes the release after the sdist/wheel + PyPI jobs succeed).
-# Recomputes the source tarball sha256 for the new tag and pushes an
-# updated Formula/blemees.rb to blemees/homebrew-tap.
+# Called from release.yml after gh-release succeeds. Also runnable
+# manually via workflow_dispatch (useful for re-syncing the tap to an
+# existing tag, e.g. after an out-of-band formula edit).
+#
+# Why workflow_call instead of `on: release: published`? Events caused
+# by GITHUB_TOKEN — including the release object created by
+# softprops/action-gh-release in release.yml — are deliberately
+# suppressed by GitHub to prevent workflow loops. So the
+# `release: published` event never fires for our automated releases.
+# Driving this directly from release.yml via workflow_call avoids
+# the suppression entirely.
 #
 # Secret required: TAP_GITHUB_TOKEN
 #   A fine-grained PAT (or GitHub App installation token) scoped to
 #   the blemees/homebrew-tap repo with permissions:
 #     Contents: Read and write
 #   Add at: Settings → Secrets and variables → Actions → New repository secret.
-#
-# Manual run: use the "Run workflow" button and pass an existing tag
-# (e.g. v0.1.0) to re-sync the tap without cutting a new release.
 
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        description: "Git tag (e.g. v0.6.0) to bump the tap to."
+        type: string
+        required: true
+    secrets:
+      TAP_GITHUB_TOKEN:
+        required: true
   workflow_dispatch:
     inputs:
       tag:
-        description: "Git tag to bump the tap to (e.g. v0.1.0)"
+        description: "Git tag (e.g. v0.6.0) to bump the tap to."
         required: true
 
 permissions: {}
@@ -30,19 +41,6 @@ jobs:
     name: Update tap formula
     runs-on: ubuntu-latest
     steps:
-      - name: Resolve tag
-        id: tag
-        env:
-          INPUT_TAG: ${{ github.event.inputs.tag }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: |
-          TAG="${INPUT_TAG:-$RELEASE_TAG}"
-          if [[ -z "$TAG" ]]; then
-            echo "::error::Could not resolve tag from event payload"
-            exit 1
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
       - name: Checkout tap
         uses: actions/checkout@v4
         with:
@@ -52,10 +50,14 @@ jobs:
 
       - name: Compute url + sha256 and rewrite formula
         env:
-          TAG: ${{ steps.tag.outputs.tag }}
+          TAG: ${{ inputs.tag }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          if [[ -z "${TAG:-}" ]]; then
+            echo "::error::Missing tag input"
+            exit 1
+          fi
           URL="https://github.com/${REPO}/archive/refs/tags/${TAG}.tar.gz"
           SHA256=$(curl -fsSL "$URL" | shasum -a 256 | awk '{print $1}')
           echo "url=$URL"
@@ -76,7 +78,7 @@ jobs:
 
       - name: Commit and push
         env:
-          TAG: ${{ steps.tag.outputs.tag }}
+          TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           cd tap

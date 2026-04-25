@@ -1,12 +1,12 @@
 name: Release
 
 # Triggered by pushing a tag like v0.1.0. Pipeline order:
-#   build → publish-pypi → gh-release
-# The GitHub Release is intentionally the last step so that downstream
-# automation listening on `release: published` (e.g. bump-tap.yml) only
-# fires after PyPI is green. If PyPI publish fails the release is not
-# created and the tap is not bumped — the package stays consistent
-# across channels.
+#   build → publish-pypi → gh-release → bump-tap
+# bump-tap is invoked as a reusable workflow (workflow_call) rather
+# than via `on: release: published`, because GitHub suppresses
+# downstream events caused by GITHUB_TOKEN — softprops/action-gh-release
+# uses GITHUB_TOKEN, so the release event never fires for our automated
+# releases. Calling the reusable workflow directly avoids that.
 
 on:
   push:
@@ -52,9 +52,8 @@ jobs:
 
   gh-release:
     name: Attach to GitHub Release
-    # Run after PyPI so downstream automation listening on
-    # `release: published` (bump-tap.yml) only fires once the wheel is
-    # actually installable from PyPI.
+    # Runs after PyPI so the release object only materialises once the
+    # wheel is installable from PyPI.
     needs: publish-pypi
     runs-on: ubuntu-latest
     steps:
@@ -66,3 +65,15 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+
+  bump-tap:
+    name: Bump Homebrew tap
+    # Last step in the pipeline. Uses the reusable workflow so we get
+    # to keep bump-tap.yml's standalone workflow_dispatch entry point
+    # for manual re-syncs.
+    needs: gh-release
+    uses: ./.github/workflows/bump-tap.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets:
+      TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
