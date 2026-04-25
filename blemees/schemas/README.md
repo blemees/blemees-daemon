@@ -1,13 +1,25 @@
 # blemees — wire-frame JSON Schemas
 
 Machine-readable contract for every frame on the `blemees/1` protocol.
-The prose spec is the repository root `README.md`; the schemas in this directory
-formalize the frame shapes referenced there.
+The prose spec is the repository root `README.md`; the schemas in this
+directory formalize the frame shapes referenced there.
+
+These ship inside the `blemees` wheel as the `blemees.schemas`
+subpackage, so installed clients can validate frames without copying
+JSON anywhere:
+
+```python
+from blemees.schemas import load, iter_schemas, files
+
+hello = load("inbound/blemeesd.hello.json")   # parsed dict
+all_frames = list(iter_schemas())             # every shipped schema
+root = files()                                # importlib.resources Traversable
+```
 
 ## Layout
 
 ```
-schemas/
+blemees/schemas/
   _common.json               # shared $defs (SessionId, Seq, MessageContent, …)
   inbound/                   # client → daemon frames
     blemeesd.hello.json
@@ -58,21 +70,16 @@ schemas/
 
 ## Use
 
-Validate a frame with any JSON Schema 2020-12 library. In Python:
+Validate a frame with any JSON Schema 2020-12 library. From an
+installed `blemees` wheel:
 
 ```python
-import json
-from pathlib import Path
+from blemees.schemas import iter_schemas
 from jsonschema import Draft202012Validator
 from referencing import Registry, Resource
 
-schemas_dir = Path("schemas").resolve()
-store = {
-    # Load every schema into an $id → schema map so $refs resolve locally.
-    json.loads(p.read_text())["$id"]: json.loads(p.read_text())
-    for p in schemas_dir.rglob("*.json")
-}
-
+# Build a registry once so $refs (e.g. into _common.json) resolve.
+store = {s["$id"]: s for s in iter_schemas()}
 registry = Registry()
 for uri, schema in store.items():
     registry = registry.with_resource(uri, Resource.from_contents(schema))
@@ -80,6 +87,17 @@ for uri, schema in store.items():
 def validate(frame_type: str, frame: dict, direction: str = "inbound") -> None:
     url = f"https://blemees/schemas/{direction}/{frame_type}.json"
     Draft202012Validator(store[url], registry=registry).validate(frame)
+```
+
+If you need on-disk paths (for tooling that does not understand
+`importlib.resources`), use `as_file`:
+
+```python
+from importlib.resources import as_file
+from blemees.schemas import files
+
+with as_file(files() / "inbound" / "blemeesd.hello.json") as p:
+    print(p)   # real filesystem path you can hand to a generator
 ```
 
 Generators (`datamodel-code-generator`, `quicktype`, etc.) can turn

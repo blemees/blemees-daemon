@@ -37,7 +37,12 @@ dev = [
 ]
 
 [tool.setuptools]
-packages = ["blemees"]
+packages = ["blemees", "blemees.schemas"]
+
+[tool.setuptools.package-data]
+# Ship the JSON Schemas (and their README) inside the wheel so clients
+# can resolve them via `importlib.resources.files("blemees.schemas")`.
+"blemees.schemas" = ["*.json", "*.md", "inbound/*.json", "outbound/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

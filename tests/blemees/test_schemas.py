@@ -1,13 +1,14 @@
-"""Validate the JSON Schemas in ``schemas/`` parse, meta-validate, and
-accept canonical example frames. If ``jsonschema`` is not installed the
-test is skipped rather than failed — schemas remain a contract even if
-the dev dep isn't available.
+"""Validate the shipped JSON Schemas: parse, meta-validate, and accept
+canonical example frames. Loads via `importlib.resources` so the test
+exercises the same lookup path clients will use after `pip install`.
+If ``jsonschema`` is not installed the test is skipped rather than
+failed — schemas remain a contract even if the dev dep isn't available.
 """
 
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from importlib import resources
 
 import pytest
 
@@ -15,13 +16,23 @@ jsonschema = pytest.importorskip("jsonschema")
 from jsonschema import Draft202012Validator  # noqa: E402  (gated by importorskip)
 from referencing import Registry, Resource  # noqa: E402
 
-SCHEMAS_DIR = Path(__file__).resolve().parents[2] / "schemas"
+SCHEMAS_ROOT = resources.files("blemees.schemas")
+
+
+def _iter_schema_paths():
+    for direction in ("inbound", "outbound"):
+        for entry in (SCHEMAS_ROOT / direction).iterdir():
+            if entry.name.endswith(".json"):
+                yield entry
+    common = SCHEMAS_ROOT / "_common.json"
+    if common.is_file():
+        yield common
 
 
 def _load_all() -> dict[str, dict]:
     return {
-        json.loads(p.read_text())["$id"]: json.loads(p.read_text())
-        for p in SCHEMAS_DIR.rglob("*.json")
+        json.loads(p.read_text(encoding="utf-8"))["$id"]: json.loads(p.read_text(encoding="utf-8"))
+        for p in _iter_schema_paths()
     }
 
 
@@ -33,19 +44,54 @@ def _registry(store: dict[str, dict]) -> Registry:
 
 
 # ---------------------------------------------------------------------------
+# Public helpers (`blemees.schemas.load`, `iter_schemas`, `files`).
+# These exist precisely so end users don't need to know about
+# importlib.resources; the tests here pin the contract.
+# ---------------------------------------------------------------------------
+
+
+def test_blemees_schemas_load_returns_parsed_schema():
+    from blemees.schemas import load
+
+    s = load("inbound/blemeesd.hello.json")
+    assert s["$id"] == "https://blemees/schemas/inbound/blemeesd.hello.json"
+    assert s["$schema"] == "https://json-schema.org/draft/2020-12/schema"
+
+
+def test_blemees_schemas_iter_yields_every_inbound_and_outbound_frame():
+    from blemees.schemas import iter_schemas
+
+    ids = {s["$id"] for s in iter_schemas()}
+    # Spot-check a few well-known frames; the exhaustive list is in
+    # blemees/schemas/README.md.
+    assert "https://blemees/schemas/inbound/blemeesd.hello.json" in ids
+    assert "https://blemees/schemas/inbound/claude.user.json" in ids
+    assert "https://blemees/schemas/outbound/blemeesd.hello_ack.json" in ids
+    assert "https://blemees/schemas/outbound/claude.event.json" in ids
+
+
+def test_blemees_schemas_files_is_traversable_and_lists_top_level():
+    from blemees.schemas import files
+
+    names = {entry.name for entry in files().iterdir()}
+    # Subpackages (inbound, outbound), the shared $defs file, and the README.
+    assert {"inbound", "outbound", "_common.json", "README.md"}.issubset(names)
+
+
+# ---------------------------------------------------------------------------
 # Meta-validation
 # ---------------------------------------------------------------------------
 
 
 def test_every_schema_parses_and_declares_id_and_schema():
-    for path in SCHEMAS_DIR.rglob("*.json"):
+    for path in _iter_schema_paths():
         obj = json.loads(path.read_text())
         assert obj.get("$schema") == "https://json-schema.org/draft/2020-12/schema", path
         assert obj.get("$id", "").startswith("https://blemees/schemas/"), path
 
 
 def test_every_schema_is_valid_against_draft_2020_12_metaschema():
-    for path in SCHEMAS_DIR.rglob("*.json"):
+    for path in _iter_schema_paths():
         obj = json.loads(path.read_text())
         # Raises SchemaError if the schema itself is malformed.
         Draft202012Validator.check_schema(obj)
