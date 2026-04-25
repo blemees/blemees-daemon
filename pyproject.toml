@@ -26,6 +26,7 @@ dependencies = []
 
 [project.scripts]
 blemeesd = "blemees.__main__:main"
+blemees = "blemees.cli:main"
 
 [project.optional-dependencies]
 dev = [
