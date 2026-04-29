@@ -36,8 +36,8 @@ dev = [
     "ruff>=0.6",
 ]
 
-[tool.setuptools]
-packages = ["blemees", "blemees.schemas"]
+[tool.setuptools.packages.find]
+include = ["blemees*"]
 
 [tool.setuptools.package-data]
 # Ship the JSON Schemas (and their README) inside the wheel so clients
