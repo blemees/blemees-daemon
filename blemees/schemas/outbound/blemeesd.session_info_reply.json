@@ -2,12 +2,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://blemees/schemas/outbound/blemeesd.session_info_reply.json",
   "title": "blemeesd.session_info_reply",
-  "description": "Snapshot of per-session counters maintained by the daemon. Fields inside last_turn_usage / cumulative_usage are pass-through from Anthropic's usage block, so new keys may appear over time (additionalProperties: true).",
+  "description": "Snapshot of per-session counters maintained by the daemon. Fields inside last_turn_usage / cumulative_usage are accumulated from the normalised agent.result.usage block; new keys may appear as backends grow (additionalProperties: true).",
   "type": "object",
   "properties": {
     "type": { "const": "blemeesd.session_info_reply" },
     "id": { "$ref": "https://blemees/schemas/_common.json#/$defs/RequestId" },
     "session_id": { "$ref": "https://blemees/schemas/_common.json#/$defs/SessionId" },
+    "backend": { "$ref": "https://blemees/schemas/_common.json#/$defs/Backend" },
+    "native_session_id": { "type": "string" },
     "model": { "type": ["string", "null"] },
     "cwd": { "type": ["string", "null"] },
     "turns": { "type": "integer", "minimum": 0 },
@@ -16,17 +18,7 @@
       "type": "object",
       "additionalProperties": { "type": "integer" }
     },
-    "cumulative_usage": {
-      "type": "object",
-      "properties": {
-        "input_tokens": { "type": "integer", "minimum": 0 },
-        "output_tokens": { "type": "integer", "minimum": 0 },
-        "cache_read_input_tokens": { "type": "integer", "minimum": 0 },
-        "cache_creation_input_tokens": { "type": "integer", "minimum": 0 }
-      },
-      "required": ["input_tokens", "output_tokens"],
-      "additionalProperties": { "type": "integer" }
-    },
+    "cumulative_usage": { "$ref": "https://blemees/schemas/_common.json#/$defs/NormalisedUsage" },
     "context_tokens": {
       "type": "integer",
       "minimum": 0,
@@ -39,6 +31,7 @@
   "required": [
     "type",
     "session_id",
+    "backend",
     "turns",
     "last_turn_usage",
     "cumulative_usage",

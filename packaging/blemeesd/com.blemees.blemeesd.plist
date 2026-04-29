@@ -12,6 +12,19 @@
         <string>blemeesd</string>
     </array>
 
+    <!--
+        If `claude` or `codex` aren't on launchd's PATH, point at them
+        explicitly:
+            <key>EnvironmentVariables</key>
+            <dict>
+                <key>BLEMEESD_CLAUDE</key>
+                <string>/Users/you/.local/bin/claude</string>
+                <key>BLEMEESD_CODEX</key>
+                <string>/Users/you/.local/bin/codex</string>
+            </dict>
+        Both default to the bare binary name resolved through PATH.
+    -->
+
     <key>RunAtLoad</key>
     <true/>
 

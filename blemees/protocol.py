@@ -2,28 +2,29 @@
 
 Responsibilities:
     * Encode/decode newline-delimited JSON frames.
-    * Validate ``blemeesd.*`` control messages into typed dataclasses.
-    * Map `blemeesd.open` fields onto ``claude -p`` CLI flags.
-    * Reject unsafe flags.
+    * Validate ``blemeesd.*`` and ``agent.user`` control messages into
+      typed dataclasses.
+    * Validate the per-backend ``options.<backend>`` block — backend
+      specific knob handling and argv assembly live in
+      ``blemees.backends.<backend>``, not here.
 
 All dataclasses are immutable and carry only the fields required by the
 dispatcher. Inbound frames whose schemas set ``additionalProperties: false``
-are rejected when unknown keys are present; ``blemeesd.open`` (which uses
-``additionalProperties: true``) is the only exception.
+are rejected when unknown keys are present.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import json
-from collections.abc import Iterable
 from typing import Any
 
 from . import PROTOCOL_VERSION
+from .backends import KNOWN_BACKENDS
 from .errors import (
     OversizeMessageError,
     ProtocolError,
-    UnsafeFlagError,
+    UnknownBackendError,
 )
 
 DEFAULT_MAX_LINE_BYTES = 16 * 1024 * 1024
@@ -40,13 +41,13 @@ def encode(obj: dict[str, Any]) -> bytes:
     return (json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
 
 
-def hello_ack(daemon_version: str, pid: int, claude_version: str | None) -> dict[str, Any]:
+def hello_ack(daemon_version: str, pid: int, backends: dict[str, str]) -> dict[str, Any]:
     return {
         "type": "blemeesd.hello_ack",
         "daemon": f"blemeesd/{daemon_version}",
         "protocol": PROTOCOL_VERSION,
         "pid": pid,
-        "claude_version": claude_version,
+        "backends": dict(backends),
     }
 
 
@@ -56,12 +57,15 @@ def error_frame(
     *,
     id: str | None = None,
     session_id: str | None = None,
+    backend: str | None = None,
 ) -> dict[str, Any]:
     frame: dict[str, Any] = {"type": "blemeesd.error", "code": code, "message": message}
     if id is not None:
         frame["id"] = id
     if session_id is not None:
         frame["session_id"] = session_id
+    if backend is not None:
+        frame["backend"] = backend
     return frame
 
 
@@ -98,11 +102,7 @@ def parse_line(line: bytes, *, max_bytes: int = DEFAULT_MAX_LINE_BYTES) -> dict[
 
 
 def _reject_extra_keys(obj: dict[str, Any], allowed: frozenset[str]) -> None:
-    """Raise :class:`ProtocolError` when *obj* contains keys not in *allowed*.
-
-    Applied to every parse function whose inbound schema sets
-    ``additionalProperties: false``.
-    """
+    """Raise :class:`ProtocolError` when *obj* contains keys not in *allowed*."""
     extra = obj.keys() - allowed
     if extra:
         field = next(iter(sorted(extra)))
@@ -124,15 +124,16 @@ class HelloMessage:
 class OpenMessage:
     id: str | None
     session_id: str
+    backend: str
+    options: dict[str, Any]
     resume: bool
-    fields: dict[str, Any]  # raw validated fields for flag mapping
     last_seen_seq: int | None = None
 
 
 @dataclasses.dataclass(slots=True)
 class UserMessage:
     session_id: str
-    message: dict[str, Any]  # pass-through to ``claude -p`` stream-json stdin
+    message: dict[str, Any]
 
 
 @dataclasses.dataclass(slots=True)
@@ -197,102 +198,42 @@ def parse_hello(obj: dict[str, Any]) -> HelloMessage:
     return HelloMessage(client=client, protocol=protocol)
 
 
-# Fields the daemon refuses outright (spec §5.4).
-UNSAFE_FLAG_FIELDS: frozenset[str] = frozenset(
-    {
-        "dangerously_skip_permissions",
-        "allow_dangerously_skip_permissions",
-        "bare",
-        "continue",
-        "continue_",  # python reserved-word-friendly alias
-        "from_pr",
-    }
+_OPEN_TOP_LEVEL = frozenset(
+    {"type", "id", "session_id", "backend", "resume", "last_seen_seq", "options"}
 )
-
-# Fields also refused if passed literally under their CLI form.
-UNSAFE_LITERAL_FLAGS: frozenset[str] = frozenset(
-    {
-        "--dangerously-skip-permissions",
-        "--allow-dangerously-skip-permissions",
-        "--bare",
-        "--continue",
-        "--from-pr",
-    }
-)
-
-
-_OPEN_VALID_FIELDS = {
-    "id",
-    "session_id",
-    "resume",
-    "last_seen_seq",
-    "model",
-    "system_prompt",
-    "append_system_prompt",
-    "tools",
-    "disallowed_tools",
-    "permission_mode",
-    "cwd",
-    "add_dir",
-    "effort",
-    "agent",
-    "agents",
-    "mcp_config",
-    "strict_mcp_config",
-    "settings",
-    "setting_sources",
-    "plugin_dir",
-    "betas",
-    "exclude_dynamic_system_prompt_sections",
-    "max_budget_usd",
-    "json_schema",
-    "fallback_model",
-    "session_name",
-    "session_persistence",
-    "include_partial_messages",
-    "replay_user_messages",
-    "type",
-}
-
-
-# Fields the daemon owns and refuses to accept from clients. These are part
-# of the daemon's contract with ``claude -p`` — overriding them would break
-# the event stream the daemon multiplexes.
-FIXED_FLAG_FIELDS: frozenset[str] = frozenset({"input_format", "output_format"})
 
 
 def parse_open(obj: dict[str, Any]) -> OpenMessage:
+    _reject_extra_keys(obj, _OPEN_TOP_LEVEL)
+
     session_id = obj.get("session_id")
     if not isinstance(session_id, str) or not session_id:
         raise ProtocolError("open requires non-empty 'session_id'")
+
+    backend = obj.get("backend")
+    if not isinstance(backend, str) or not backend:
+        raise ProtocolError("open requires non-empty 'backend'")
+    if backend not in KNOWN_BACKENDS:
+        raise UnknownBackendError(backend)
+
+    options_field = obj.get("options")
+    if options_field is None:
+        raise ProtocolError("open requires 'options'")
+    if not isinstance(options_field, dict):
+        raise ProtocolError("'options' must be an object")
+    # The schema rejects sibling backends here too, but the daemon is
+    # permissive: we read only the matching backend's block.
+    backend_options = options_field.get(backend)
+    if backend_options is None:
+        backend_options = {}
+    if not isinstance(backend_options, dict):
+        raise ProtocolError(f"'options.{backend}' must be an object")
+    # Reject sibling-backend blocks so malformed clients don't go silent.
+    for key in options_field:
+        if key not in KNOWN_BACKENDS:
+            raise ProtocolError(f"unknown options block: {key!r}")
+
     resume = bool(obj.get("resume", False))
-
-    # Refuse explicit unsafe flag keys.
-    for field in obj.keys():
-        if field in UNSAFE_FLAG_FIELDS:
-            raise UnsafeFlagError(field)
-
-    # Refuse daemon-owned flags. The stream-json format both ways is part of
-    # the daemon's contract with ``claude -p``; letting clients change it
-    # would break the event multiplexing.
-    for field in obj.keys():
-        if field in FIXED_FLAG_FIELDS:
-            raise ProtocolError(f"{field!r} is not client-settable; daemon always uses stream-json")
-
-    # Refuse unsafe CLI literals accidentally smuggled through free-form fields.
-    for literal in UNSAFE_LITERAL_FLAGS:
-        for value in obj.values():
-            if isinstance(value, str) and value == literal:
-                raise UnsafeFlagError(literal)
-            if isinstance(value, list):
-                for item in value:
-                    if isinstance(item, str) and item == literal:
-                        raise UnsafeFlagError(literal)
-
-    fields: dict[str, Any] = {}
-    for key, value in obj.items():
-        if key in _OPEN_VALID_FIELDS:
-            fields[key] = value
 
     req_id = obj.get("id")
     if req_id is not None and not isinstance(req_id, str):
@@ -306,8 +247,9 @@ def parse_open(obj: dict[str, Any]) -> OpenMessage:
     return OpenMessage(
         id=req_id,
         session_id=session_id,
+        backend=backend,
+        options=backend_options,
         resume=resume,
-        fields=fields,
         last_seen_seq=last_seen_seq,
     )
 
@@ -319,7 +261,7 @@ def parse_user(obj: dict[str, Any]) -> UserMessage:
         raise ProtocolError("user requires 'session_id'")
     message = obj.get("message")
     if not isinstance(message, dict):
-        raise ProtocolError("user requires 'message' object (pass-through to claude stream-json)")
+        raise ProtocolError("user requires 'message' object")
     role = message.get("role")
     if role != "user":
         raise ProtocolError("message.role must be 'user'")
@@ -410,118 +352,3 @@ def parse_session_info(obj: dict[str, Any]) -> SessionInfoMessage:
     if req_id is not None and not isinstance(req_id, str):
         raise ProtocolError("'id' must be a string")
     return SessionInfoMessage(id=req_id, session_id=session_id)
-
-
-# ---------------------------------------------------------------------------
-# Open → argv mapping (spec §5.4 / §6.1).
-# ---------------------------------------------------------------------------
-
-
-def build_claude_argv(
-    claude_bin: str,
-    open_msg: OpenMessage,
-    *,
-    for_resume: bool = False,
-) -> list[str]:
-    """Translate an :class:`OpenMessage` into a ``claude`` argv list.
-
-    Only fields explicitly set on ``open_msg`` produce CLI flags. The daemon
-    always forces ``--verbose`` (required by CC when ``--output-format
-    stream-json`` is used with ``-p``).
-
-    When ``for_resume`` is true, emits ``--resume <session>``; otherwise
-    ``--session-id <session>`` or ``--resume`` per the original open.
-    """
-    f = open_msg.fields
-    argv: list[str] = [claude_bin, "-p", "--verbose"]
-
-    use_resume = for_resume or open_msg.resume
-    if use_resume:
-        argv += ["--resume", open_msg.session_id]
-    else:
-        argv += ["--session-id", open_msg.session_id]
-
-    # stream-json both ways is fixed by the daemon — see FIXED_FLAG_FIELDS.
-    # The event multiplexer parses JSON lines off stdout and expects JSON
-    # input-format lines on stdin, so this is not a client-tunable knob.
-    argv += ["--input-format", "stream-json"]
-    argv += ["--output-format", "stream-json"]
-
-    def add(flag: str, value: Any) -> None:
-        argv.append(flag)
-        argv.append(str(value))
-
-    def add_list(flag: str, values: Iterable[Any]) -> None:
-        argv.append(flag)
-        argv.extend(str(v) for v in values)
-
-    if "model" in f and f["model"] is not None:
-        add("--model", f["model"])
-    if "system_prompt" in f and f["system_prompt"] is not None:
-        add("--system-prompt", f["system_prompt"])
-    if "append_system_prompt" in f and f["append_system_prompt"] is not None:
-        add("--append-system-prompt", f["append_system_prompt"])
-    if "tools" in f and f["tools"] is not None:
-        # Empty string is a legitimate value (disable all tools).
-        add("--tools", f["tools"])
-    if "disallowed_tools" in f and f["disallowed_tools"]:
-        add_list("--disallowedTools", f["disallowed_tools"])
-    if "permission_mode" in f and f["permission_mode"] is not None:
-        add("--permission-mode", f["permission_mode"])
-    if "add_dir" in f and f["add_dir"]:
-        add_list("--add-dir", f["add_dir"])
-    if "effort" in f and f["effort"] is not None:
-        add("--effort", f["effort"])
-    if "agent" in f and f["agent"] is not None:
-        add("--agent", f["agent"])
-    if "agents" in f and f["agents"] is not None:
-        # Client passes a dict; serialise to JSON.
-        if isinstance(f["agents"], str):
-            add("--agents", f["agents"])
-        else:
-            add("--agents", json.dumps(f["agents"], separators=(",", ":")))
-    if "mcp_config" in f and f["mcp_config"]:
-        add_list("--mcp-config", f["mcp_config"])
-    if f.get("strict_mcp_config"):
-        argv.append("--strict-mcp-config")
-    if "settings" in f and f["settings"] is not None:
-        add("--settings", f["settings"])
-    if "setting_sources" in f and f["setting_sources"] is not None:
-        add("--setting-sources", f["setting_sources"])
-    if "plugin_dir" in f and f["plugin_dir"]:
-        for item in f["plugin_dir"]:
-            add("--plugin-dir", item)
-    if "betas" in f and f["betas"]:
-        add_list("--betas", f["betas"])
-    if f.get("exclude_dynamic_system_prompt_sections"):
-        argv.append("--exclude-dynamic-system-prompt-sections")
-    if "max_budget_usd" in f and f["max_budget_usd"] is not None:
-        add("--max-budget-usd", f["max_budget_usd"])
-    if "json_schema" in f and f["json_schema"] is not None:
-        if isinstance(f["json_schema"], str):
-            add("--json-schema", f["json_schema"])
-        else:
-            add("--json-schema", json.dumps(f["json_schema"], separators=(",", ":")))
-    if "fallback_model" in f and f["fallback_model"] is not None:
-        add("--fallback-model", f["fallback_model"])
-    if "session_name" in f and f["session_name"] is not None:
-        add("-n", f["session_name"])
-    if "session_persistence" in f and f["session_persistence"] is False:
-        argv.append("--no-session-persistence")
-    if f.get("include_partial_messages"):
-        argv.append("--include-partial-messages")
-    if f.get("replay_user_messages"):
-        argv.append("--replay-user-messages")
-
-    return argv
-
-
-def build_user_stdin_line(session_id: str, *, message: dict[str, Any]) -> bytes:
-    """Envelope-only translation of ``claude.user`` to CC's stream-json stdin.
-
-    The inbound frame already carries a validated ``message`` dict in CC's
-    native shape; the daemon only swaps the outer ``type`` and renames
-    ``session`` to ``session_id`` for the subprocess.
-    """
-    payload = {"type": "user", "message": message, "session_id": session_id}
-    return (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")

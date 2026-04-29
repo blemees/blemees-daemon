@@ -72,7 +72,7 @@ def test_event_log_path_joins():
 
 
 def _open_msg(session: str = "s1") -> OpenMessage:
-    return OpenMessage(id=None, session_id=session, resume=False, fields={"session_id": session})
+    return OpenMessage(id=None, session_id=session, backend="claude", options={}, resume=False)
 
 
 async def test_session_assigns_monotonic_seq_and_buffers():
@@ -190,10 +190,10 @@ async def test_session_finishing_triggers_soft_kill_on_result():
 
     sess = Session(session_id="s1", open_msg=_open_msg(), cwd=None)
     sub = FakeSub()
-    sess.subprocess = sub  # type: ignore[assignment]
+    sess.backend = sub  # type: ignore[assignment]
     sess.mark_finishing()
 
-    await sess.on_event({"type": "claude.result", "session_id": "s1", "subtype": "success"})
+    await sess.on_event({"type": "agent.result", "session_id": "s1", "subtype": "success"})
     # Give the scheduled close task a chance to run.
     await asyncio.sleep(0.01)
     assert sub.closed is True

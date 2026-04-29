@@ -105,17 +105,25 @@ async def test_shutdown_waits_for_in_flight_turn(tmp_path, monkeypatch):
     try:
         s = await _connect(cfg.socket_path)
         try:
-            await s.send({"type": "blemeesd.open", "id": "r1", "session_id": "g", "tools": ""})
+            await s.send(
+                {
+                    "type": "blemeesd.open",
+                    "id": "r1",
+                    "session_id": "g",
+                    "backend": "claude",
+                    "options": {"claude": {"tools": ""}},
+                }
+            )
             await s.wait_for(lambda e: e.get("type") == "blemeesd.opened")
             await s.send(
                 {
-                    "type": "claude.user",
+                    "type": "agent.user",
                     "session_id": "g",
                     "message": {"role": "user", "content": "hi"},
                 }
             )
             # Turn is now active; wait for first event so we're past spawn.
-            await s.wait_for(lambda e: e.get("type") == "claude.stream_event")
+            await s.wait_for(lambda e: e.get("type") == "agent.delta")
 
             t0 = time.monotonic()
             daemon.request_shutdown()
@@ -145,16 +153,24 @@ async def test_shutdown_force_kills_when_grace_expires(tmp_path, monkeypatch):
     try:
         s = await _connect(cfg.socket_path)
         try:
-            await s.send({"type": "blemeesd.open", "id": "r1", "session_id": "slow", "tools": ""})
+            await s.send(
+                {
+                    "type": "blemeesd.open",
+                    "id": "r1",
+                    "session_id": "slow",
+                    "backend": "claude",
+                    "options": {"claude": {"tools": ""}},
+                }
+            )
             await s.wait_for(lambda e: e.get("type") == "blemeesd.opened")
             await s.send(
                 {
-                    "type": "claude.user",
+                    "type": "agent.user",
                     "session_id": "slow",
                     "message": {"role": "user", "content": "go"},
                 }
             )
-            await s.wait_for(lambda e: e.get("type") == "claude.stream_event")
+            await s.wait_for(lambda e: e.get("type") == "agent.delta")
 
             t0 = time.monotonic()
             daemon.request_shutdown()
@@ -182,16 +198,24 @@ async def test_shutdown_grace_zero_kills_immediately(tmp_path, monkeypatch):
     try:
         s = await _connect(cfg.socket_path)
         try:
-            await s.send({"type": "blemeesd.open", "id": "r1", "session_id": "z", "tools": ""})
+            await s.send(
+                {
+                    "type": "blemeesd.open",
+                    "id": "r1",
+                    "session_id": "z",
+                    "backend": "claude",
+                    "options": {"claude": {"tools": ""}},
+                }
+            )
             await s.wait_for(lambda e: e.get("type") == "blemeesd.opened")
             await s.send(
                 {
-                    "type": "claude.user",
+                    "type": "agent.user",
                     "session_id": "z",
                     "message": {"role": "user", "content": "go"},
                 }
             )
-            await s.wait_for(lambda e: e.get("type") == "claude.stream_event")
+            await s.wait_for(lambda e: e.get("type") == "agent.delta")
 
             t0 = time.monotonic()
             daemon.request_shutdown()
@@ -218,7 +242,15 @@ async def test_shutdown_skips_wait_for_idle_sessions(tmp_path, monkeypatch):
     try:
         s = await _connect(cfg.socket_path)
         try:
-            await s.send({"type": "blemeesd.open", "id": "r1", "session_id": "idle", "tools": ""})
+            await s.send(
+                {
+                    "type": "blemeesd.open",
+                    "id": "r1",
+                    "session_id": "idle",
+                    "backend": "claude",
+                    "options": {"claude": {"tools": ""}},
+                }
+            )
             await s.wait_for(lambda e: e.get("type") == "blemeesd.opened")
             # No user turn sent; session is idle.
             t0 = time.monotonic()

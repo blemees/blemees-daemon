@@ -22,6 +22,7 @@ DEFAULT_CONFIG_PATH = Path.home() / ".config" / "blemeesd" / "config.toml"
 class Config:
     socket_path: str
     claude_bin: str = "claude"
+    codex_bin: str = "codex"
     log_level: str = "info"
     log_file: str | None = None
     max_line_bytes: int = 16 * 1024 * 1024
@@ -64,6 +65,7 @@ def _env_overrides() -> dict[str, Any]:
     mapping = {
         "BLEMEESD_SOCKET": "socket_path",
         "BLEMEESD_CLAUDE": "claude_bin",
+        "BLEMEESD_CODEX": "codex_bin",
         "BLEMEESD_LOG_LEVEL": "log_level",
         "BLEMEESD_LOG_FILE": "log_file",
         "BLEMEESD_MAX_LINE": "max_line_bytes",
@@ -91,6 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="blemeesd")
     parser.add_argument("--socket", dest="socket_path", help="Unix socket path")
     parser.add_argument("--claude", dest="claude_bin", help="Path to the claude binary")
+    parser.add_argument("--codex", dest="codex_bin", help="Path to the codex binary")
     parser.add_argument("--log-level", dest="log_level", help="debug|info|warning|error")
     parser.add_argument("--log-file", dest="log_file", help="Log file path (default stderr)")
     parser.add_argument("--config", dest="config_path", help="TOML config file")

@@ -65,9 +65,11 @@ def test_blemees_schemas_iter_yields_every_inbound_and_outbound_frame():
     # Spot-check a few well-known frames; the exhaustive list is in
     # blemees/schemas/README.md.
     assert "https://blemees/schemas/inbound/blemeesd.hello.json" in ids
-    assert "https://blemees/schemas/inbound/claude.user.json" in ids
+    assert "https://blemees/schemas/inbound/agent.user.json" in ids
+    assert "https://blemees/schemas/inbound/options.claude.json" in ids
+    assert "https://blemees/schemas/inbound/options.codex.json" in ids
     assert "https://blemees/schemas/outbound/blemeesd.hello_ack.json" in ids
-    assert "https://blemees/schemas/outbound/claude.event.json" in ids
+    assert "https://blemees/schemas/outbound/agent.event.json" in ids
 
 
 def test_blemees_schemas_files_is_traversable_and_lists_top_level():
@@ -125,7 +127,7 @@ def test_inbound_hello_ok(store_and_registry):
         store,
         reg,
         "https://blemees/schemas/inbound/blemeesd.hello.json",
-        {"type": "blemeesd.hello", "protocol": "blemees/1", "client": "test/0"},
+        {"type": "blemeesd.hello", "protocol": "blemees/2", "client": "test/0"},
     )
 
 
@@ -135,21 +137,41 @@ def test_inbound_hello_rejects_wrong_protocol(store_and_registry):
         store,
         reg,
         "https://blemees/schemas/inbound/blemeesd.hello.json",
-        {"type": "blemeesd.hello", "protocol": "blemees/99"},
+        {"type": "blemeesd.hello", "protocol": "blemees/1"},
     )
 
 
-def test_inbound_open_minimal(store_and_registry):
+def test_inbound_open_minimal_claude(store_and_registry):
     store, reg = store_and_registry
     _validate(
         store,
         reg,
         "https://blemees/schemas/inbound/blemeesd.open.json",
-        {"type": "blemeesd.open", "session_id": "s1"},
+        {
+            "type": "blemeesd.open",
+            "session_id": "s1",
+            "backend": "claude",
+            "options": {"claude": {}},
+        },
     )
 
 
-def test_inbound_open_rejects_unsafe_flag(store_and_registry):
+def test_inbound_open_minimal_codex(store_and_registry):
+    store, reg = store_and_registry
+    _validate(
+        store,
+        reg,
+        "https://blemees/schemas/inbound/blemeesd.open.json",
+        {
+            "type": "blemeesd.open",
+            "session_id": "s1",
+            "backend": "codex",
+            "options": {"codex": {}},
+        },
+    )
+
+
+def test_inbound_open_rejects_unknown_backend(store_and_registry):
     store, reg = store_and_registry
     _assert_invalid(
         store,
@@ -158,43 +180,101 @@ def test_inbound_open_rejects_unsafe_flag(store_and_registry):
         {
             "type": "blemeesd.open",
             "session_id": "s1",
-            "dangerously_skip_permissions": True,
+            "backend": "anthropic",
+            "options": {},
         },
     )
 
 
-def test_inbound_open_rejects_input_format(store_and_registry):
+def test_inbound_open_rejects_top_level_legacy_field(store_and_registry):
+    """`model` and friends used to live at the top of blemeesd.open in
+    blemees/1; in blemees/2 they belong under options.claude.*."""
     store, reg = store_and_registry
     _assert_invalid(
         store,
         reg,
         "https://blemees/schemas/inbound/blemeesd.open.json",
-        {"type": "blemeesd.open", "session_id": "s1", "input_format": "text"},
+        {
+            "type": "blemeesd.open",
+            "session_id": "s1",
+            "backend": "claude",
+            "options": {"claude": {}},
+            "model": "sonnet",
+        },
     )
 
 
-def test_inbound_claude_user_string_content(store_and_registry):
+def test_options_claude_rejects_unsafe_flag(store_and_registry):
+    store, reg = store_and_registry
+    _assert_invalid(
+        store,
+        reg,
+        "https://blemees/schemas/inbound/options.claude.json",
+        {"dangerously_skip_permissions": True},
+    )
+
+
+def test_options_claude_rejects_input_format(store_and_registry):
+    store, reg = store_and_registry
+    _assert_invalid(
+        store,
+        reg,
+        "https://blemees/schemas/inbound/options.claude.json",
+        {"input_format": "text"},
+    )
+
+
+def test_options_codex_rejects_unknown_key(store_and_registry):
+    store, reg = store_and_registry
+    _assert_invalid(
+        store,
+        reg,
+        "https://blemees/schemas/inbound/options.codex.json",
+        {"approval_policy": "never"},  # underscore form — codex uses approval-policy
+    )
+
+
+def test_options_codex_accepts_full_set(store_and_registry):
     store, reg = store_and_registry
     _validate(
         store,
         reg,
-        "https://blemees/schemas/inbound/claude.user.json",
+        "https://blemees/schemas/inbound/options.codex.json",
         {
-            "type": "claude.user",
+            "model": "gpt-5.2-codex",
+            "profile": "default",
+            "cwd": "/home/u/proj",
+            "sandbox": "read-only",
+            "approval-policy": "never",
+            "developer-instructions": "be terse",
+            "config": {"model_reasoning_effort": "medium"},
+            "include_raw_events": False,
+        },
+    )
+
+
+def test_inbound_agent_user_string_content(store_and_registry):
+    store, reg = store_and_registry
+    _validate(
+        store,
+        reg,
+        "https://blemees/schemas/inbound/agent.user.json",
+        {
+            "type": "agent.user",
             "session_id": "s1",
             "message": {"role": "user", "content": "hi"},
         },
     )
 
 
-def test_inbound_claude_user_multimodal_content(store_and_registry):
+def test_inbound_agent_user_multimodal_content(store_and_registry):
     store, reg = store_and_registry
     _validate(
         store,
         reg,
-        "https://blemees/schemas/inbound/claude.user.json",
+        "https://blemees/schemas/inbound/agent.user.json",
         {
-            "type": "claude.user",
+            "type": "agent.user",
             "session_id": "s1",
             "message": {
                 "role": "user",
@@ -210,27 +290,27 @@ def test_inbound_claude_user_multimodal_content(store_and_registry):
     )
 
 
-def test_inbound_claude_user_rejects_wrong_role(store_and_registry):
+def test_inbound_agent_user_rejects_wrong_role(store_and_registry):
     store, reg = store_and_registry
     _assert_invalid(
         store,
         reg,
-        "https://blemees/schemas/inbound/claude.user.json",
+        "https://blemees/schemas/inbound/agent.user.json",
         {
-            "type": "claude.user",
+            "type": "agent.user",
             "session_id": "s1",
             "message": {"role": "assistant", "content": "x"},
         },
     )
 
 
-def test_inbound_claude_user_rejects_legacy_text_shorthand(store_and_registry):
+def test_inbound_agent_user_rejects_legacy_text_shorthand(store_and_registry):
     store, reg = store_and_registry
     _assert_invalid(
         store,
         reg,
-        "https://blemees/schemas/inbound/claude.user.json",
-        {"type": "claude.user", "session_id": "s1", "text": "hi"},
+        "https://blemees/schemas/inbound/agent.user.json",
+        {"type": "agent.user", "session_id": "s1", "text": "hi"},
     )
 
 
@@ -253,14 +333,31 @@ def test_outbound_hello_ack_ok(store_and_registry):
         {
             "type": "blemeesd.hello_ack",
             "daemon": "blemeesd/0.1.0",
-            "protocol": "blemees/1",
+            "protocol": "blemees/2",
             "pid": 12345,
-            "claude_version": "2.1.118",
+            "backends": {"claude": "2.1.118", "codex": "0.125.0"},
         },
     )
 
 
-def test_outbound_opened_carries_last_seq(store_and_registry):
+def test_outbound_hello_ack_allows_partial_backends(store_and_registry):
+    """The daemon may detect only some backends at startup; missing ones drop out."""
+    store, reg = store_and_registry
+    _validate(
+        store,
+        reg,
+        "https://blemees/schemas/outbound/blemeesd.hello_ack.json",
+        {
+            "type": "blemeesd.hello_ack",
+            "daemon": "blemeesd/0.1.0",
+            "protocol": "blemees/2",
+            "pid": 12345,
+            "backends": {"claude": "2.1.118"},
+        },
+    )
+
+
+def test_outbound_opened_carries_backend_and_last_seq(store_and_registry):
     store, reg = store_and_registry
     _validate(
         store,
@@ -270,6 +367,8 @@ def test_outbound_opened_carries_last_seq(store_and_registry):
             "type": "blemeesd.opened",
             "id": "r1",
             "session_id": "s1",
+            "backend": "claude",
+            "native_session_id": "s1",
             "subprocess_pid": 9999,
             "last_seq": 0,
         },
@@ -283,6 +382,30 @@ def test_outbound_error_enum(store_and_registry):
         reg,
         "https://blemees/schemas/outbound/blemeesd.error.json",
         {"type": "blemeesd.error", "code": "invalid_message", "message": "bad field"},
+    )
+    _validate(
+        store,
+        reg,
+        "https://blemees/schemas/outbound/blemeesd.error.json",
+        {
+            "type": "blemeesd.error",
+            "code": "auth_failed",
+            "backend": "codex",
+            "message": "run `codex login`",
+        },
+    )
+    # Old codes are gone in blemees/2.
+    _assert_invalid(
+        store,
+        reg,
+        "https://blemees/schemas/outbound/blemeesd.error.json",
+        {"type": "blemeesd.error", "code": "claude_crashed", "message": "x"},
+    )
+    _assert_invalid(
+        store,
+        reg,
+        "https://blemees/schemas/outbound/blemeesd.error.json",
+        {"type": "blemeesd.error", "code": "oauth_expired", "message": "x"},
     )
     _assert_invalid(
         store,
@@ -317,40 +440,116 @@ def test_outbound_session_taken_ok(store_and_registry):
     )
 
 
-def test_outbound_claude_event_envelope(store_and_registry):
+def test_outbound_agent_event_system_init(store_and_registry):
     store, reg = store_and_registry
-    schema_id = "https://blemees/schemas/outbound/claude.event.json"
+    schema_id = "https://blemees/schemas/outbound/agent.event.json"
     _validate(
         store,
         reg,
         schema_id,
         {
-            "type": "claude.stream_event",
+            "type": "agent.system_init",
             "session_id": "s1",
-            "seq": 3,
-            "event": {
-                "type": "content_block_delta",
-                "delta": {"type": "text_delta", "text": "hi"},
+            "seq": 1,
+            "backend": "claude",
+            "model": "claude-sonnet-4-6",
+            "tools": ["Bash", "Read", "Edit"],
+            "native_session_id": "s1",
+        },
+    )
+
+
+def test_outbound_agent_event_delta(store_and_registry):
+    store, reg = store_and_registry
+    schema_id = "https://blemees/schemas/outbound/agent.event.json"
+    _validate(
+        store,
+        reg,
+        schema_id,
+        {
+            "type": "agent.delta",
+            "session_id": "s1",
+            "seq": 2,
+            "backend": "codex",
+            "kind": "text",
+            "text": "Hello",
+            "item_id": "msg_xyz",
+        },
+    )
+
+
+def test_outbound_agent_event_result_with_usage(store_and_registry):
+    store, reg = store_and_registry
+    schema_id = "https://blemees/schemas/outbound/agent.event.json"
+    _validate(
+        store,
+        reg,
+        schema_id,
+        {
+            "type": "agent.result",
+            "session_id": "s1",
+            "seq": 5,
+            "backend": "codex",
+            "subtype": "success",
+            "duration_ms": 4371,
+            "num_turns": 1,
+            "turn_id": "3",
+            "usage": {
+                "input_tokens": 11761,
+                "output_tokens": 28,
+                "cache_read_input_tokens": 4480,
+                "reasoning_output_tokens": 20,
             },
         },
     )
-    # Rejects non-claude. prefix.
+
+
+def test_outbound_agent_event_rejects_non_agent_prefix(store_and_registry):
+    store, reg = store_and_registry
+    schema_id = "https://blemees/schemas/outbound/agent.event.json"
     _assert_invalid(
         store,
         reg,
         schema_id,
-        {"type": "system", "session_id": "s1", "seq": 1},
+        {"type": "claude.stream_event", "session_id": "s1", "seq": 1, "backend": "claude"},
     )
-    # Requires seq for session-stream frames.
+
+
+def test_outbound_agent_event_requires_seq_and_backend(store_and_registry):
+    store, reg = store_and_registry
+    schema_id = "https://blemees/schemas/outbound/agent.event.json"
     _assert_invalid(
         store,
         reg,
         schema_id,
-        {"type": "claude.system", "session_id": "s1"},
+        {"type": "agent.system_init", "session_id": "s1", "backend": "claude"},
+    )
+    _assert_invalid(
+        store,
+        reg,
+        schema_id,
+        {"type": "agent.system_init", "session_id": "s1", "seq": 1},
     )
 
 
-def test_outbound_sessions_listing(store_and_registry):
+def test_outbound_agent_event_delta_requires_kind(store_and_registry):
+    store, reg = store_and_registry
+    schema_id = "https://blemees/schemas/outbound/agent.event.json"
+    _assert_invalid(
+        store,
+        reg,
+        schema_id,
+        {
+            "type": "agent.delta",
+            "session_id": "s1",
+            "seq": 2,
+            "backend": "claude",
+            "text": "hi",
+        },
+    )
+
+
+def test_outbound_sessions_listing_with_backend(store_and_registry):
     store, reg = store_and_registry
     _validate(
         store,
@@ -363,12 +562,13 @@ def test_outbound_sessions_listing(store_and_registry):
             "sessions": [
                 {
                     "session_id": "abc",
+                    "backend": "claude",
                     "attached": False,
                     "mtime_ms": 1745000000000,
                     "size": 4321,
                     "preview": "fix the bug",
                 },
-                {"session_id": "live", "attached": True},
+                {"session_id": "live", "backend": "codex", "attached": True},
             ],
         },
     )

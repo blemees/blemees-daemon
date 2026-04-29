@@ -10,11 +10,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-import shutil
 import signal
 import socket
 import stat
-import subprocess as _stdlib_subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -22,6 +20,20 @@ from pathlib import Path
 from typing import Any
 
 from . import PROTOCOL_VERSION, __version__
+from .backends.claude import (
+    ClaudeBackend,
+    build_argv as build_claude_argv,
+    detect_version as detect_claude_version,
+    list_on_disk_sessions as list_claude_session_files,
+    validate_options as validate_claude_options,
+)
+from .backends.codex import (
+    CodexBackend,
+    build_argv as build_codex_argv,
+    detect_version as detect_codex_version,
+    list_on_disk_sessions as list_codex_session_files,
+    validate_options as validate_codex_options,
+)
 from .config import Config
 from .errors import (
     DAEMON_SHUTDOWN,
@@ -33,6 +45,7 @@ from .errors import (
     SESSION_UNKNOWN,
     SLOW_CONSUMER,
     SPAWN_FAILED,
+    UNKNOWN_BACKEND,
     UNKNOWN_MESSAGE,
     UNSAFE_FLAG,
     BlemeesError,
@@ -41,6 +54,7 @@ from .errors import (
     SessionBusyError,
     SessionExistsError,
     SpawnFailedError,
+    UnknownBackendError,
     UnsafeFlagError,
 )
 from .logging import StructuredLogger
@@ -49,8 +63,6 @@ from .protocol import (
     OpenMessage,
     PingMessage,
     StatusMessage,
-    build_claude_argv,
-    build_user_stdin_line,
     encode,
     error_frame,
     hello_ack,
@@ -68,7 +80,6 @@ from .protocol import (
     parse_watch,
 )
 from .session import SessionTable, make_reaper
-from .subprocess import ClaudeSubprocess, list_session_files
 
 # Reserved `blemeesd.*` types that the daemon explicitly refuses with
 # ``unknown_message`` (Appendix B). All four originally-reserved verbs
@@ -83,21 +94,16 @@ _CONNECTION_QUEUE_SIZE = 1024
 _SHUTDOWN_BUDGET_S = 5.0
 
 
-def detect_claude_version(claude_bin: str) -> str | None:
-    """Run ``claude --version`` once at startup. Best-effort; None on failure."""
-    path = shutil.which(claude_bin) or claude_bin
-    try:
-        out = _stdlib_subprocess.run(
-            [path, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, _stdlib_subprocess.SubprocessError):
-        return None
-    if out.returncode != 0:
-        return None
-    return (out.stdout or out.stderr or "").strip() or None
+def detect_backends(config: Config) -> dict[str, str]:
+    """Probe each known backend for a version string. Best-effort."""
+    out: dict[str, str] = {}
+    cv = detect_claude_version(config.claude_bin)
+    if cv:
+        out["claude"] = cv
+    xv = detect_codex_version(config.codex_bin)
+    if xv:
+        out["codex"] = xv
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +129,7 @@ class Connection:
         config: Config,
         sessions: SessionTable,
         logger: StructuredLogger,
-        claude_version: str | None,
+        backends: dict[str, str],
         shutdown_event: asyncio.Event,
         lookup_connection: Callable[[int], Connection | None] | None = None,
         status_snapshot: Callable[[], dict[str, Any]] | None = None,
@@ -133,7 +139,7 @@ class Connection:
         self._writer = writer
         self._config = config
         self._sessions = sessions
-        self._claude_version = claude_version
+        self._backends = backends
         self._shutdown = shutdown_event
         self._lookup_connection = lookup_connection
         self._status_snapshot = status_snapshot
@@ -219,7 +225,7 @@ class Connection:
             hello_ack(
                 daemon_version=__version__,
                 pid=os.getpid(),
-                claude_version=self._claude_version,
+                backends=self._backends,
             )
         )
         self._log.info("connection.hello", client=hello.client)
@@ -266,7 +272,7 @@ class Connection:
         try:
             if msg_type == "blemeesd.open":
                 await self._handle_open(parse_open(obj))
-            elif msg_type == "claude.user":
+            elif msg_type == "agent.user":
                 await self._handle_user(parse_user(obj))
             elif msg_type == "blemeesd.interrupt":
                 await self._handle_interrupt(parse_interrupt(obj))
@@ -294,6 +300,8 @@ class Connection:
                 )
         except UnsafeFlagError as exc:
             await self._emit_error(UNSAFE_FLAG, exc.message, id=obj.get("id"))
+        except UnknownBackendError as exc:
+            await self._emit_error(UNKNOWN_BACKEND, exc.message, id=obj.get("id"))
         except ProtocolError as exc:
             await self._emit_error(INVALID_MESSAGE, exc.message, id=obj.get("id"))
         except BlemeesError as exc:
@@ -307,6 +315,58 @@ class Connection:
     # ------------------------------------------------------------------
     # Handlers
     # ------------------------------------------------------------------
+
+    def _make_backend(
+        self,
+        msg: OpenMessage,
+        *,
+        on_event,
+        for_resume: bool,
+        thread_id: str | None = None,
+    ):
+        """Construct a per-session AgentBackend from the open message.
+
+        Validates the per-backend options block (refusing unsafe flags
+        and daemon-owned keys) and assembles the spawn-time argv.
+        ``thread_id`` is the cached Codex ``threadId`` (from a prior
+        ``session_configured`` event) — used so a respawn after resume
+        or interrupt routes the first ``tools/call`` through
+        ``codex-reply`` instead of starting a new thread.
+        """
+        if msg.backend == "claude":
+            validate_claude_options(msg.options)
+            argv = build_claude_argv(
+                self._config.claude_bin,
+                session_id=msg.session_id,
+                options=msg.options,
+                for_resume=for_resume,
+            )
+            return ClaudeBackend(
+                session_id=msg.session_id,
+                argv=argv,
+                cwd=msg.options.get("cwd"),
+                on_event=on_event,
+                logger=self._log,
+                stderr_rate_lines=self._config.stderr_rate_lines,
+                stderr_rate_window_s=self._config.stderr_rate_window_s,
+                include_raw_events=bool(msg.options.get("include_raw_events", False)),
+            )
+        if msg.backend == "codex":
+            validate_codex_options(msg.options)
+            argv = build_codex_argv(self._config.codex_bin, options=msg.options)
+            return CodexBackend(
+                session_id=msg.session_id,
+                argv=argv,
+                cwd=msg.options.get("cwd"),
+                options=msg.options,
+                on_event=on_event,
+                logger=self._log,
+                stderr_rate_lines=self._config.stderr_rate_lines,
+                stderr_rate_window_s=self._config.stderr_rate_window_s,
+                include_raw_events=bool(msg.options.get("include_raw_events", False)),
+                thread_id=thread_id,
+            )
+        raise UnknownBackendError(msg.backend)
 
     async def _handle_open(self, msg: OpenMessage) -> None:
         existing = self._sessions.try_get(msg.session_id)
@@ -335,43 +395,47 @@ class Connection:
             sess = self._sessions.new_session(msg)
             await self._sessions.register(sess)
 
-        # (Re)spawn the subprocess first so we have a pid for the ack. Any
+        # (Re)spawn the backend first so we have a pid for the ack. Any
         # events the child emits before we attach buffer into the session's
         # ring and get delivered below.
-        if sess.subprocess is None or not sess.subprocess.running:
-            argv = build_claude_argv(self._config.claude_bin, msg, for_resume=msg.resume)
-            proc = ClaudeSubprocess(
-                session_id=msg.session_id,
-                argv=argv,
-                cwd=msg.fields.get("cwd"),
+        if sess.backend is None or not sess.backend.running:
+            backend = self._make_backend(
+                msg,
                 on_event=sess.on_event,
-                logger=self._log,
-                stderr_rate_lines=self._config.stderr_rate_lines,
-                stderr_rate_window_s=self._config.stderr_rate_window_s,
+                for_resume=msg.resume,
+                thread_id=sess.native_session_id,
             )
             try:
-                await proc.spawn()
+                await backend.spawn()
             except SpawnFailedError as exc:
                 await self._sessions.remove(msg.session_id, delete_file=False)
                 await self._emit_error(
                     SPAWN_FAILED, exc.message, id=msg.id, session_id=msg.session_id
                 )
                 return
-            sess.subprocess = proc
+            sess.backend = backend
 
         self._owned_sessions.add(msg.session_id)
 
         # Send ack before the event stream so clients can match the reply
-        # before they start consuming (possibly replayed) frames.
-        await self._emit_frame(
-            {
-                "type": "blemeesd.opened",
-                "id": msg.id,
-                "session_id": msg.session_id,
-                "subprocess_pid": sess.subprocess.pid,
-                "last_seq": sess.seq,
-            }
-        )
+        # before they start consuming (possibly replayed) frames. For
+        # Claude the native id always equals our session id; for Codex we
+        # only emit ``native_session_id`` once it's been observed (omit
+        # on a fresh open — the schema permits absence on the first
+        # opened frame).
+        opened_frame: dict[str, Any] = {
+            "type": "blemeesd.opened",
+            "id": msg.id,
+            "session_id": msg.session_id,
+            "backend": msg.backend,
+            "subprocess_pid": sess.backend.pid,
+            "last_seq": sess.seq,
+        }
+        if msg.backend == "claude":
+            opened_frame["native_session_id"] = msg.session_id
+        elif sess.native_session_id:
+            opened_frame["native_session_id"] = sess.native_session_id
+        await self._emit_frame(opened_frame)
 
         # If the client asked for replay we honour it now; otherwise the
         # attach just wires live delivery and any frames queued since spawn
@@ -384,35 +448,31 @@ class Connection:
         self._log.info(
             "session.open",
             session_id=msg.session_id,
+            backend=msg.backend,
             resume=msg.resume,
             replayed=replay.get("replayed", 0),
-            model=msg.fields.get("model"),
+            model=msg.options.get("model"),
         )
 
     async def _handle_user(self, msg) -> None:
         sess = self._sessions.get(msg.session_id)
-        if sess.subprocess is None or not sess.subprocess.running:
-            # Respawn transparently (spec §9.1): "Next claude.user respawns via --resume"
-            new_argv = build_claude_argv(self._config.claude_bin, sess.open_msg, for_resume=True)
-            proc = ClaudeSubprocess(
-                session_id=sess.session_id,
-                argv=new_argv,
-                cwd=sess.cwd,
+        if sess.backend is None or not sess.backend.running:
+            # Respawn transparently (spec §9.1).
+            backend = self._make_backend(
+                sess.open_msg,
                 on_event=sess.on_event,
-                logger=self._log,
-                stderr_rate_lines=self._config.stderr_rate_lines,
-                stderr_rate_window_s=self._config.stderr_rate_window_s,
+                for_resume=True,
+                thread_id=sess.native_session_id,
             )
             try:
-                await proc.spawn()
+                await backend.spawn()
             except SpawnFailedError as exc:
                 await self._emit_error(SPAWN_FAILED, exc.message, session_id=msg.session_id)
                 return
-            sess.subprocess = proc
+            sess.backend = backend
 
-        line = build_user_stdin_line(session_id=msg.session_id, message=msg.message)
         try:
-            await sess.subprocess.send_user_line(line)
+            await sess.backend.send_user_turn(msg.message)
         except SessionBusyError as exc:
             await self._emit_error(SESSION_BUSY, exc.message, session_id=msg.session_id)
         except SpawnFailedError as exc:
@@ -420,7 +480,7 @@ class Connection:
 
     async def _handle_interrupt(self, msg) -> None:
         sess = self._sessions.try_get(msg.session_id)
-        if sess is None or sess.subprocess is None:
+        if sess is None or sess.backend is None:
             await self._emit_frame(
                 {
                     "type": "blemeesd.interrupted",
@@ -430,7 +490,7 @@ class Connection:
             )
             return
         self._log.info("session.interrupt", session_id=msg.session_id)
-        did_kill = await sess.subprocess.interrupt()
+        did_kill = await sess.backend.interrupt()
         await self._emit_frame(
             {
                 "type": "blemeesd.interrupted",
@@ -440,14 +500,38 @@ class Connection:
         )
 
     async def _handle_list_sessions(self, msg) -> None:
-        on_disk = list_session_files(msg.cwd)
-        merged: dict[str, dict] = {row["session_id"]: {**row, "attached": False} for row in on_disk}
+        # On-disk transcripts from each backend, dedup-keyed by
+        # ``(backend, session_id)`` so a freak collision between a
+        # claude session id and a codex threadId doesn't fold the rows
+        # together.
+        merged: dict[tuple[str, str], dict] = {}
+        for row in list_claude_session_files(msg.cwd):
+            key = ("claude", row["session_id"])
+            merged[key] = {**row, "backend": "claude", "attached": False}
+        for row in list_codex_session_files(msg.cwd):
+            key = ("codex", row["session_id"])
+            merged[key] = {**row, "backend": "codex", "attached": False}
         # Overlay in-memory sessions for the same cwd. Transcripts can lag
         # the first turn, so a session with no file yet still shows up.
         for sess in self._sessions.iter_by_cwd(msg.cwd):
-            rec = merged.get(sess.session_id) or {"session_id": sess.session_id}
+            # For codex, the on-disk row is keyed by threadId, while the
+            # in-memory session is keyed by the daemon's session_id —
+            # which equals the threadId only after the client resumed
+            # from a list_sessions row. Match on whichever id we know.
+            candidate_keys: list[tuple[str, str]] = [(sess.backend_name, sess.session_id)]
+            if sess.backend_name == "codex" and sess.native_session_id:
+                candidate_keys.append(("codex", sess.native_session_id))
+            existing_key: tuple[str, str] | None = None
+            for k in candidate_keys:
+                if k in merged:
+                    existing_key = k
+                    break
+            rec = merged.get(existing_key) if existing_key else None
+            if rec is None:
+                rec = {"session_id": sess.session_id}
             rec["attached"] = sess.connection_id is not None
-            merged[sess.session_id] = rec
+            rec["backend"] = sess.backend_name
+            merged[existing_key or (sess.backend_name, sess.session_id)] = rec
         sessions = sorted(merged.values(), key=lambda r: r.get("mtime_ms") or 0, reverse=True)
         self._log.info("session.list", cwd=msg.cwd, count=len(sessions))
         await self._emit_frame(
@@ -550,7 +634,7 @@ class Connection:
                 session_id=msg.session_id,
             )
             return
-        subproc_running = sess.subprocess is not None and sess.subprocess.running
+        subproc_running = sess.backend is not None and sess.backend.running
         snap = sess.usage_snapshot(
             attached=sess.connection_id is not None,
             subprocess_running=subproc_running,
@@ -708,11 +792,11 @@ class Daemon:
         self._connections: set[Connection] = set()
         self._shutdown_event = asyncio.Event()
         self._reaper_task: asyncio.Task | None = None
-        self._claude_version: str | None = None
+        self._backends: dict[str, str] = {}
         self._start_time: float = time.monotonic()
 
     async def start(self) -> None:
-        self._claude_version = detect_claude_version(self._config.claude_bin)
+        self._backends = detect_backends(self._config)
         _prepare_socket_path(self._config.socket_path, self._log)
 
         self._server = await asyncio.start_unix_server(
@@ -725,7 +809,7 @@ class Daemon:
             "daemon.start",
             socket=self._config.socket_path,
             pid=os.getpid(),
-            claude_version=self._claude_version,
+            backends=self._backends,
             version=__version__,
         )
 
@@ -736,7 +820,7 @@ class Daemon:
             config=self._config,
             sessions=self._sessions,
             logger=self._log,
-            claude_version=self._claude_version,
+            backends=self._backends,
             shutdown_event=self._shutdown_event,
             lookup_connection=self._lookup_connection,
             status_snapshot=self._status_snapshot,
@@ -760,19 +844,23 @@ class Daemon:
         total = len(sessions)
         attached = sum(1 for s in sessions if s.connection_id is not None)
         active = len(self._sessions.iter_with_active_turn())
+        by_backend: dict[str, int] = {}
+        for s in sessions:
+            by_backend[s.backend_name] = by_backend.get(s.backend_name, 0) + 1
         return {
             "daemon": f"blemeesd/{__version__}",
             "protocol": PROTOCOL_VERSION,
             "pid": os.getpid(),
-            "claude_version": self._claude_version,
             "uptime_s": round(now - self._start_time, 3),
             "socket_path": self._config.socket_path,
+            "backends": dict(self._backends),
             "connections": len(self._connections),
             "sessions": {
                 "total": total,
                 "attached": attached,
                 "detached": total - attached,
                 "active_turns": active,
+                "by_backend": by_backend,
             },
             "config": {
                 "ring_buffer_size": self._config.ring_buffer_size,
@@ -816,7 +904,7 @@ class Daemon:
                 await asyncio.wait_for(self._server.wait_closed(), timeout=_SHUTDOWN_BUDGET_S)
 
         # Graceful phase: let sessions with an in-flight turn run to the next
-        # claude.result so their transcript closes cleanly. Same soft-detach
+        # agent.result so their transcript closes cleanly. Same soft-detach
         # policy as client disconnect (§5.9). Capped by shutdown_grace_s.
         grace = self._config.shutdown_grace_s
         active = self._sessions.iter_with_active_turn()
@@ -831,7 +919,7 @@ class Daemon:
             try:
                 await asyncio.wait_for(
                     asyncio.gather(
-                        *(s.subprocess.wait_for_exit(grace) for s in active),
+                        *(s.backend.wait_for_exit(grace) for s in active if s.backend is not None),
                         return_exceptions=True,
                     ),
                     timeout=grace,

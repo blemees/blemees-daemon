@@ -49,16 +49,72 @@ async def test_protocol_mismatch_closes_connection(daemon_and_socket):
 async def test_open_then_user_then_result(client_factory, fake_mode):
     fake_mode("normal")
     client = await client_factory()
-    await client.send({"type": "blemeesd.open", "id": "r1", "session_id": "s1", "tools": ""})
+    await client.send(
+        {
+            "type": "blemeesd.open",
+            "id": "r1",
+            "session_id": "s1",
+            "backend": "claude",
+            "options": {"claude": {"tools": ""}},
+        }
+    )
     opened = await client.wait_for(lambda e: e["type"] == "blemeesd.opened")
     assert opened["session_id"] == "s1"
     await client.send(
-        {"type": "claude.user", "session_id": "s1", "message": {"role": "user", "content": "hello"}}
+        {"type": "agent.user", "session_id": "s1", "message": {"role": "user", "content": "hello"}}
     )
     result = await client.wait_for(
-        lambda e: e.get("type") == "claude.result" and e.get("session_id") == "s1"
+        lambda e: e.get("type") == "agent.result" and e.get("session_id") == "s1"
     )
     assert result["subtype"] == "success"
+
+
+async def test_codex_backend_open_user_result(client_factory, fake_mode):
+    """Drive the daemon end-to-end against fake_codex.py for one turn.
+
+    The agent.* shape should be indistinguishable from the Claude path —
+    same envelope, same field names, same usage keys.
+    """
+    fake_mode("normal")
+    client = await client_factory()
+    await client.send(
+        {
+            "type": "blemeesd.open",
+            "id": "r1",
+            "session_id": "cx-1",
+            "backend": "codex",
+            "options": {"codex": {"sandbox": "read-only", "approval-policy": "never"}},
+        }
+    )
+    opened = await client.wait_for(lambda e: e["type"] == "blemeesd.opened")
+    assert opened["session_id"] == "cx-1"
+    assert opened["backend"] == "codex"
+    await client.send(
+        {
+            "type": "agent.user",
+            "session_id": "cx-1",
+            "message": {"role": "user", "content": "hello"},
+        }
+    )
+    events = await client.wait_for(
+        lambda e: e.get("type") == "agent.result" and e.get("session_id") == "cx-1",
+        collect=True,
+    )
+    kinds = [e["type"] for e in events]
+    assert "agent.system_init" in kinds
+    assert "agent.delta" in kinds
+    assert "agent.message" in kinds
+    result = events[-1]
+    assert result["subtype"] == "success"
+    assert result["backend"] == "codex"
+    # Usage normalisation: Codex's `cached_input_tokens` is renamed.
+    assert "cache_read_input_tokens" in result["usage"]
+    assert "reasoning_output_tokens" in result["usage"]
+    # The synthesised system_init should carry the codex-specific
+    # capabilities envelope.
+    init = next(e for e in events if e["type"] == "agent.system_init")
+    assert init["model"] == "fake-codex"
+    assert init["capabilities"]["sandbox_policy"]["type"] == "read-only"
 
 
 async def test_unsafe_flag_rejected_on_open(client_factory):
@@ -68,7 +124,8 @@ async def test_unsafe_flag_rejected_on_open(client_factory):
             "type": "blemeesd.open",
             "id": "r1",
             "session_id": "s1",
-            "dangerously_skip_permissions": True,
+            "backend": "claude",
+            "options": {"claude": {"dangerously_skip_permissions": True}},
         }
     )
     err = await client.wait_for(lambda e: e.get("type") == "blemeesd.error")
@@ -98,14 +155,19 @@ async def test_session_flag_mapping_in_argv(client_factory, fake_mode, argv_trac
             "type": "blemeesd.open",
             "id": "r1",
             "session_id": "s-map",
-            "model": "sonnet",
-            "tools": "",
-            "permission_mode": "bypassPermissions",
+            "backend": "claude",
+            "options": {
+                "claude": {
+                    "model": "sonnet",
+                    "tools": "",
+                    "permission_mode": "bypassPermissions",
+                },
+            },
         }
     )
     await client.wait_for(lambda e: e.get("type") == "blemeesd.opened")
     # Wait for the first CC event so we know fake_claude has recorded its argv.
-    await client.wait_for(lambda e: e.get("type") == "claude.system")
+    await client.wait_for(lambda e: e.get("type") == "agent.system_init")
     argv_lines = Path(argv_trace_path).read_text().strip().splitlines()
     assert argv_lines, "fake claude was not spawned"
     argv = json.loads(argv_lines[0])
@@ -127,12 +189,13 @@ async def test_resume_flag_used_when_requested(client_factory, fake_mode, argv_t
             "type": "blemeesd.open",
             "id": "r1",
             "session_id": "s-resume",
+            "backend": "claude",
             "resume": True,
-            "tools": "",
+            "options": {"claude": {"tools": ""}},
         }
     )
     await client.wait_for(lambda e: e.get("type") == "blemeesd.opened")
-    await client.wait_for(lambda e: e.get("type") == "claude.system")
+    await client.wait_for(lambda e: e.get("type") == "agent.system_init")
     argv = json.loads(Path(argv_trace_path).read_text().strip().splitlines()[0])
     assert "--resume" in argv
     assert "--session-id" not in argv
@@ -143,13 +206,21 @@ async def test_interrupt_respawns_with_resume(
 ):
     fake_mode("slow")
     client = await client_factory()
-    await client.send({"type": "blemeesd.open", "id": "r1", "session_id": "s-int", "tools": ""})
+    await client.send(
+        {
+            "type": "blemeesd.open",
+            "id": "r1",
+            "session_id": "s-int",
+            "backend": "claude",
+            "options": {"claude": {"tools": ""}},
+        }
+    )
     await client.wait_for(lambda e: e.get("type") == "blemeesd.opened")
     await client.send(
-        {"type": "claude.user", "session_id": "s-int", "message": {"role": "user", "content": "go"}}
+        {"type": "agent.user", "session_id": "s-int", "message": {"role": "user", "content": "go"}}
     )
     # Wait until streaming starts.
-    await client.wait_for(lambda e: e.get("type") == "claude.stream_event")
+    await client.wait_for(lambda e: e.get("type") == "agent.delta")
     await client.send({"type": "blemeesd.interrupt", "session_id": "s-int"})
     ir = await client.wait_for(lambda e: e.get("type") == "blemeesd.interrupted")
     assert ir["was_idle"] is False
@@ -173,7 +244,13 @@ async def test_concurrent_sessions_dont_interfere(client_factory, fake_mode):
     client = await client_factory()
     for sid in ("a", "b", "c"):
         await client.send(
-            {"type": "blemeesd.open", "id": f"r{sid}", "session_id": sid, "tools": ""}
+            {
+                "type": "blemeesd.open",
+                "id": f"r{sid}",
+                "session_id": sid,
+                "backend": "claude",
+                "options": {"claude": {"tools": ""}},
+            }
         )
     opens = set()
     while len(opens) < 3:
@@ -184,7 +261,7 @@ async def test_concurrent_sessions_dont_interfere(client_factory, fake_mode):
     for sid in ("a", "b", "c"):
         await client.send(
             {
-                "type": "claude.user",
+                "type": "agent.user",
                 "session_id": sid,
                 "message": {"role": "user", "content": f"hi-{sid}"},
             }
@@ -193,7 +270,7 @@ async def test_concurrent_sessions_dont_interfere(client_factory, fake_mode):
     saw: dict[str, bool] = {}
     while len(saw) < 3:
         evt = await client.recv(timeout=5.0)
-        if evt.get("type") == "claude.result" and evt.get("session_id") in {"a", "b", "c"}:
+        if evt.get("type") == "agent.result" and evt.get("session_id") in {"a", "b", "c"}:
             saw[evt["session_id"]] = True
     assert set(saw) == {"a", "b", "c"}
 
@@ -201,17 +278,25 @@ async def test_concurrent_sessions_dont_interfere(client_factory, fake_mode):
 async def test_crash_mid_turn_then_recover(client_factory, fake_mode, monkeypatch):
     fake_mode("crash")
     client = await client_factory()
-    await client.send({"type": "blemeesd.open", "id": "r1", "session_id": "s-crash", "tools": ""})
+    await client.send(
+        {
+            "type": "blemeesd.open",
+            "id": "r1",
+            "session_id": "s-crash",
+            "backend": "claude",
+            "options": {"claude": {"tools": ""}},
+        }
+    )
     await client.wait_for(lambda e: e.get("type") == "blemeesd.opened")
     await client.send(
         {
-            "type": "claude.user",
+            "type": "agent.user",
             "session_id": "s-crash",
             "message": {"role": "user", "content": "boom"},
         }
     )
     err = await client.wait_for(
-        lambda e: e.get("type") == "blemeesd.error" and e.get("code") == "claude_crashed"
+        lambda e: e.get("type") == "blemeesd.error" and e.get("code") == "backend_crashed"
     )
     assert err["session_id"] == "s-crash"
 
@@ -219,20 +304,28 @@ async def test_crash_mid_turn_then_recover(client_factory, fake_mode, monkeypatc
     fake_mode("normal")
     await client.send(
         {
-            "type": "claude.user",
+            "type": "agent.user",
             "session_id": "s-crash",
             "message": {"role": "user", "content": "again"},
         }
     )
     await client.wait_for(
-        lambda e: e.get("type") == "claude.result" and e.get("session_id") == "s-crash"
+        lambda e: e.get("type") == "agent.result" and e.get("session_id") == "s-crash"
     )
 
 
 async def test_close_removes_session(client_factory, fake_mode):
     fake_mode("normal")
     client = await client_factory()
-    await client.send({"type": "blemeesd.open", "id": "r1", "session_id": "s-close", "tools": ""})
+    await client.send(
+        {
+            "type": "blemeesd.open",
+            "id": "r1",
+            "session_id": "s-close",
+            "backend": "claude",
+            "options": {"claude": {"tools": ""}},
+        }
+    )
     await client.wait_for(lambda e: e.get("type") == "blemeesd.opened")
     await client.send(
         {"type": "blemeesd.close", "id": "r2", "session_id": "s-close", "delete": False}
@@ -241,14 +334,30 @@ async def test_close_removes_session(client_factory, fake_mode):
     assert closed["session_id"] == "s-close"
 
     # Re-open without resume should succeed since session is gone.
-    await client.send({"type": "blemeesd.open", "id": "r3", "session_id": "s-close", "tools": ""})
+    await client.send(
+        {
+            "type": "blemeesd.open",
+            "id": "r3",
+            "session_id": "s-close",
+            "backend": "claude",
+            "options": {"claude": {"tools": ""}},
+        }
+    )
     await client.wait_for(lambda e: e.get("type") == "blemeesd.opened")
 
 
 async def test_detach_allows_reattach_via_resume(client_factory, fake_mode):
     fake_mode("normal")
     c1 = await client_factory()
-    await c1.send({"type": "blemeesd.open", "id": "r1", "session_id": "s-det", "tools": ""})
+    await c1.send(
+        {
+            "type": "blemeesd.open",
+            "id": "r1",
+            "session_id": "s-det",
+            "backend": "claude",
+            "options": {"claude": {"tools": ""}},
+        }
+    )
     await c1.wait_for(lambda e: e.get("type") == "blemeesd.opened")
     await c1.close()
 
@@ -259,8 +368,9 @@ async def test_detach_allows_reattach_via_resume(client_factory, fake_mode):
             "type": "blemeesd.open",
             "id": "r2",
             "session_id": "s-det",
+            "backend": "claude",
             "resume": True,
-            "tools": "",
+            "options": {"claude": {"tools": ""}},
         }
     )
     await c2.wait_for(lambda e: e.get("type") == "blemeesd.opened")
@@ -286,7 +396,7 @@ async def test_invalid_message_keeps_connection_alive(client_factory):
 def _seed_transcript(
     home_dir: Path, cwd: str, session_id: str, preview: str | None, mtime: int
 ) -> Path:
-    from blemees.subprocess import project_dir_for_cwd as _pdfc
+    from blemees.backends.claude import project_dir_for_cwd as _pdfc
 
     # Recompute project dir against the fake $HOME so the test matches the
     # runtime encoding.
@@ -359,8 +469,8 @@ async def test_list_sessions_flags_attached(client_factory, fake_mode, tmp_path,
             "type": "blemeesd.open",
             "id": "r1",
             "session_id": "live",
-            "tools": "",
-            "cwd": cwd,
+            "backend": "claude",
+            "options": {"claude": {"tools": "", "cwd": cwd}},
         }
     )
     await client.wait_for(lambda e: e.get("type") == "blemeesd.opened")
@@ -370,6 +480,242 @@ async def test_list_sessions_flags_attached(client_factory, fake_mode, tmp_path,
     records = {s["session_id"]: s for s in reply["sessions"]}
     assert "live" in records
     assert records["live"]["attached"] is True
+
+
+def _seed_codex_rollout(
+    home_dir: Path,
+    *,
+    cwd: str,
+    thread_id: str,
+    user_text: str | None = None,
+    mtime: int | None = None,
+) -> Path:
+    """Mirror the helper in test_backend_codex but inside test_daemon_mock
+    so the daemon's list_sessions sees a Codex rollout under $HOME."""
+    day_dir = home_dir / ".codex" / "sessions" / "2026" / "04" / "27"
+    day_dir.mkdir(parents=True, exist_ok=True)
+    path = day_dir / f"rollout-2026-04-27T14-42-22-{thread_id}.jsonl"
+    lines = [
+        json.dumps(
+            {
+                "type": "session_configured",
+                "session_id": thread_id,
+                "model": "gpt-5.4",
+                "cwd": cwd,
+                "rollout_path": str(path),
+            }
+        )
+    ]
+    if user_text is not None:
+        lines.append(
+            json.dumps(
+                {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "id": "u",
+                        "content": [{"type": "text", "text": user_text}],
+                    },
+                }
+            )
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if mtime is not None:
+        os.utime(path, (mtime, mtime))
+    return path
+
+
+async def test_list_sessions_merges_claude_and_codex_rows(client_factory, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cwd = "/work/repo"
+    _seed_transcript(tmp_path, cwd, "claude-1", "claude prompt", 1_700_000_000)
+    _seed_codex_rollout(
+        tmp_path,
+        cwd=cwd,
+        thread_id="019dd03f-aaaa-0000-0000-000000000000",
+        user_text="codex prompt",
+        mtime=1_700_000_500,
+    )
+
+    client = await client_factory()
+    await client.send({"type": "blemeesd.list_sessions", "id": "r1", "cwd": cwd})
+    reply = await client.wait_for(lambda e: e.get("type") == "blemeesd.sessions")
+    rows = reply["sessions"]
+    backends = {r["session_id"]: r["backend"] for r in rows}
+    assert backends["claude-1"] == "claude"
+    assert backends["019dd03f-aaaa-0000-0000-000000000000"] == "codex"
+    # Codex row is newer → appears first.
+    assert rows[0]["backend"] == "codex"
+    assert rows[0]["preview"] == "codex prompt"
+
+
+async def test_codex_session_resume_uses_codex_reply(
+    client_factory, fake_mode, tmp_path, monkeypatch
+):
+    """Reattach via resume:true should pass the cached threadId to the
+    new CodexBackend so the next turn routes via `codex-reply`.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    fake_mode("normal")
+    rpc_log = tmp_path / "rpc.jsonl"
+    monkeypatch.setenv("BLEMEES_FAKE_RPC_LOG", str(rpc_log))
+
+    c1 = await client_factory()
+    await c1.send(
+        {
+            "type": "blemeesd.open",
+            "id": "r1",
+            "session_id": "cx-resume",
+            "backend": "codex",
+            "options": {"codex": {"sandbox": "read-only"}},
+        }
+    )
+    await c1.wait_for(lambda e: e.get("type") == "blemeesd.opened")
+    await c1.send(
+        {
+            "type": "agent.user",
+            "session_id": "cx-resume",
+            "message": {"role": "user", "content": "hi"},
+        }
+    )
+    c1_events = await c1.wait_for(
+        lambda e: e.get("type") == "agent.result" and e.get("session_id") == "cx-resume",
+        collect=True,
+    )
+    last_seq = c1_events[-1]["seq"]
+    await c1.close()
+    # Let the daemon's connection-detach finish (it runs in serve()'s
+    # finally block; c2.open racing it would find sess.backend still
+    # alive and skip the respawn — giving us no `codex-reply` call).
+    await asyncio.sleep(0.1)
+
+    # Reattach. Pass last_seen_seq so c2 doesn't get a replay of c1's
+    # already-consumed frames — the daemon should respawn with the
+    # cached threadId so the new backend's first call is `codex-reply`.
+    c2 = await client_factory()
+    await c2.send(
+        {
+            "type": "blemeesd.open",
+            "id": "r2",
+            "session_id": "cx-resume",
+            "backend": "codex",
+            "resume": True,
+            "last_seen_seq": last_seq,
+            "options": {"codex": {"sandbox": "read-only"}},
+        }
+    )
+    opened = await c2.wait_for(lambda e: e.get("type") == "blemeesd.opened")
+    # native_session_id should be populated now (we know the threadId
+    # from the previous turn).
+    assert opened.get("native_session_id"), opened
+
+    await c2.send(
+        {
+            "type": "agent.user",
+            "session_id": "cx-resume",
+            "message": {"role": "user", "content": "again"},
+        }
+    )
+    await c2.wait_for(
+        lambda e: e.get("type") == "agent.result" and e.get("session_id") == "cx-resume"
+    )
+
+    calls = [
+        json.loads(ln) for ln in rpc_log.read_text(encoding="utf-8").splitlines() if ln.strip()
+    ]
+    tools = [c["tool"] for c in calls]
+    assert tools == ["codex", "codex-reply"], tools
+    assert calls[1]["thread_id"]
+
+
+async def test_status_by_backend_counts_mixed_sessions(client_factory, fake_mode):
+    fake_mode("normal")
+    client = await client_factory()
+
+    await client.send(
+        {
+            "type": "blemeesd.open",
+            "id": "rc",
+            "session_id": "claude-1",
+            "backend": "claude",
+            "options": {"claude": {"tools": ""}},
+        }
+    )
+    await client.wait_for(
+        lambda e: e.get("type") == "blemeesd.opened" and e.get("session_id") == "claude-1"
+    )
+
+    await client.send(
+        {
+            "type": "blemeesd.open",
+            "id": "rx",
+            "session_id": "codex-1",
+            "backend": "codex",
+            "options": {"codex": {}},
+        }
+    )
+    await client.wait_for(
+        lambda e: e.get("type") == "blemeesd.opened" and e.get("session_id") == "codex-1"
+    )
+
+    await client.send({"type": "blemeesd.status", "id": "s1"})
+    snap = await client.wait_for(lambda e: e.get("type") == "blemeesd.status_reply")
+    by_backend = snap["sessions"]["by_backend"]
+    assert by_backend.get("claude") == 1, snap
+    assert by_backend.get("codex") == 1, snap
+    assert snap["sessions"]["total"] == 2
+
+
+async def test_codex_close_with_delete_unlinks_rollout(
+    client_factory, fake_mode, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    fake_mode("normal")
+
+    client = await client_factory()
+    await client.send(
+        {
+            "type": "blemeesd.open",
+            "id": "r1",
+            "session_id": "cx-del",
+            "backend": "codex",
+            "options": {"codex": {}},
+        }
+    )
+    await client.wait_for(lambda e: e.get("type") == "blemeesd.opened")
+    await client.send(
+        {
+            "type": "agent.user",
+            "session_id": "cx-del",
+            "message": {"role": "user", "content": "hi"},
+        }
+    )
+    # Wait for system_init so the rollout_path is captured.
+    await client.wait_for(
+        lambda e: e.get("type") == "agent.system_init" and e.get("session_id") == "cx-del"
+    )
+    await client.wait_for(
+        lambda e: e.get("type") == "agent.result" and e.get("session_id") == "cx-del"
+    )
+
+    # The fake codex rollout path is /tmp/fake-rollout.jsonl — write a
+    # stand-in so close{delete:true} has something to unlink.
+    fake_rollout = Path("/tmp/fake-rollout.jsonl")
+    fake_rollout.write_text("{}\n", encoding="utf-8")
+    try:
+        await client.send(
+            {
+                "type": "blemeesd.close",
+                "id": "r2",
+                "session_id": "cx-del",
+                "delete": True,
+            }
+        )
+        await client.wait_for(lambda e: e.get("type") == "blemeesd.closed")
+        assert not fake_rollout.is_file(), "rollout was not deleted"
+    finally:
+        if fake_rollout.is_file():
+            fake_rollout.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -382,7 +728,15 @@ async def test_takeover_notifies_previous_owner(client_factory, fake_mode):
     a = await client_factory()
     b = await client_factory()
 
-    await a.send({"type": "blemeesd.open", "id": "r1", "session_id": "shared", "tools": ""})
+    await a.send(
+        {
+            "type": "blemeesd.open",
+            "id": "r1",
+            "session_id": "shared",
+            "backend": "claude",
+            "options": {"claude": {"tools": ""}},
+        }
+    )
     await a.wait_for(lambda e: e.get("type") == "blemeesd.opened")
 
     # B takes over via resume=true.
@@ -391,8 +745,9 @@ async def test_takeover_notifies_previous_owner(client_factory, fake_mode):
             "type": "blemeesd.open",
             "id": "r2",
             "session_id": "shared",
+            "backend": "claude",
             "resume": True,
-            "tools": "",
+            "options": {"claude": {"tools": ""}},
         }
     )
 
@@ -408,18 +763,26 @@ async def test_takeover_notifies_previous_owner(client_factory, fake_mode):
     await b.wait_for(lambda e: e.get("type") == "blemeesd.opened")
     await b.send(
         {
-            "type": "claude.user",
+            "type": "agent.user",
             "session_id": "shared",
             "message": {"role": "user", "content": "hi"},
         }
     )
-    await b.wait_for(lambda e: e.get("type") == "claude.result" and e.get("session_id") == "shared")
+    await b.wait_for(lambda e: e.get("type") == "agent.result" and e.get("session_id") == "shared")
 
 
 async def test_no_takeover_notice_for_same_connection_reopen(client_factory, fake_mode):
     fake_mode("normal")
     c = await client_factory()
-    await c.send({"type": "blemeesd.open", "id": "r1", "session_id": "self", "tools": ""})
+    await c.send(
+        {
+            "type": "blemeesd.open",
+            "id": "r1",
+            "session_id": "self",
+            "backend": "claude",
+            "options": {"claude": {"tools": ""}},
+        }
+    )
     await c.wait_for(lambda e: e.get("type") == "blemeesd.opened")
 
     # Reopen from the same connection with resume=true — no takeover.
@@ -428,8 +791,9 @@ async def test_no_takeover_notice_for_same_connection_reopen(client_factory, fak
             "type": "blemeesd.open",
             "id": "r2",
             "session_id": "self",
+            "backend": "claude",
             "resume": True,
-            "tools": "",
+            "options": {"claude": {"tools": ""}},
         }
     )
     # The opened ack arrives; no session_taken in between.
@@ -451,17 +815,17 @@ async def test_status_returns_snapshot(client_factory, fake_mode):
     await client.send({"type": "blemeesd.status", "id": "s-1"})
     reply = await client.wait_for(lambda e: e.get("type") == "blemeesd.status_reply")
     assert reply["id"] == "s-1"
-    assert reply["protocol"] == "blemees/1"
+    assert reply["protocol"] == "blemees/2"
     assert reply["daemon"].startswith("blemeesd/")
     assert reply["pid"] > 0
     assert reply["uptime_s"] >= 0.0
     assert reply["connections"] >= 1
-    assert reply["sessions"] == {
-        "total": 0,
-        "attached": 0,
-        "detached": 0,
-        "active_turns": 0,
-    }
+    assert "backends" in reply  # may be empty if no upstream binaries detected
+    assert reply["sessions"]["total"] == 0
+    assert reply["sessions"]["attached"] == 0
+    assert reply["sessions"]["detached"] == 0
+    assert reply["sessions"]["active_turns"] == 0
+    assert reply["sessions"]["by_backend"] == {}
     cfg = reply["config"]
     assert cfg["ring_buffer_size"] > 0
     assert "shutdown_grace_s" in cfg
@@ -470,7 +834,15 @@ async def test_status_returns_snapshot(client_factory, fake_mode):
 async def test_status_reflects_open_sessions(client_factory, fake_mode):
     fake_mode("normal")
     client = await client_factory()
-    await client.send({"type": "blemeesd.open", "id": "r1", "session_id": "x", "tools": ""})
+    await client.send(
+        {
+            "type": "blemeesd.open",
+            "id": "r1",
+            "session_id": "x",
+            "backend": "claude",
+            "options": {"claude": {"tools": ""}},
+        }
+    )
     await client.wait_for(lambda e: e.get("type") == "blemeesd.opened")
     await client.send({"type": "blemeesd.status"})
     reply = await client.wait_for(lambda e: e.get("type") == "blemeesd.status_reply")
@@ -488,7 +860,15 @@ async def test_watch_receives_events_live(client_factory, fake_mode):
     owner = await client_factory()
     watcher = await client_factory()
 
-    await owner.send({"type": "blemeesd.open", "id": "r1", "session_id": "shared", "tools": ""})
+    await owner.send(
+        {
+            "type": "blemeesd.open",
+            "id": "r1",
+            "session_id": "shared",
+            "backend": "claude",
+            "options": {"claude": {"tools": ""}},
+        }
+    )
     await owner.wait_for(lambda e: e.get("type") == "blemeesd.opened")
 
     await watcher.send({"type": "blemeesd.watch", "id": "w1", "session_id": "shared"})
@@ -498,31 +878,37 @@ async def test_watch_receives_events_live(client_factory, fake_mode):
     # Drive a turn on the owner; the watcher should see the same event stream.
     await owner.send(
         {
-            "type": "claude.user",
+            "type": "agent.user",
             "session_id": "shared",
             "message": {"role": "user", "content": "hi"},
         }
     )
     await watcher.wait_for(
-        lambda e: e.get("type") == "claude.result" and e.get("session_id") == "shared"
+        lambda e: e.get("type") == "agent.result" and e.get("session_id") == "shared"
     )
 
 
 async def test_watch_replays_from_last_seen_seq(client_factory, fake_mode):
     fake_mode("normal")
     owner = await client_factory()
-    await owner.send({"type": "blemeesd.open", "id": "r1", "session_id": "rep", "tools": ""})
+    await owner.send(
+        {
+            "type": "blemeesd.open",
+            "id": "r1",
+            "session_id": "rep",
+            "backend": "claude",
+            "options": {"claude": {"tools": ""}},
+        }
+    )
     await owner.wait_for(lambda e: e.get("type") == "blemeesd.opened")
     await owner.send(
         {
-            "type": "claude.user",
+            "type": "agent.user",
             "session_id": "rep",
             "message": {"role": "user", "content": "hi"},
         }
     )
-    await owner.wait_for(
-        lambda e: e.get("type") == "claude.result" and e.get("session_id") == "rep"
-    )
+    await owner.wait_for(lambda e: e.get("type") == "agent.result" and e.get("session_id") == "rep")
 
     watcher = await client_factory()
     await watcher.send(
@@ -536,7 +922,7 @@ async def test_watch_replays_from_last_seen_seq(client_factory, fake_mode):
     await watcher.wait_for(lambda e: e.get("type") == "blemeesd.watching")
     # Should catch up through the replay and see the completed turn.
     await watcher.wait_for(
-        lambda e: e.get("type") == "claude.result" and e.get("session_id") == "rep"
+        lambda e: e.get("type") == "agent.result" and e.get("session_id") == "rep"
     )
 
 
@@ -544,7 +930,15 @@ async def test_unwatch_stops_delivery(client_factory, fake_mode):
     fake_mode("normal")
     owner = await client_factory()
     watcher = await client_factory()
-    await owner.send({"type": "blemeesd.open", "id": "r1", "session_id": "u", "tools": ""})
+    await owner.send(
+        {
+            "type": "blemeesd.open",
+            "id": "r1",
+            "session_id": "u",
+            "backend": "claude",
+            "options": {"claude": {"tools": ""}},
+        }
+    )
     await owner.wait_for(lambda e: e.get("type") == "blemeesd.opened")
     await watcher.send({"type": "blemeesd.watch", "id": "w1", "session_id": "u"})
     await watcher.wait_for(lambda e: e.get("type") == "blemeesd.watching")
@@ -553,20 +947,20 @@ async def test_unwatch_stops_delivery(client_factory, fake_mode):
     ack = await watcher.wait_for(lambda e: e.get("type") == "blemeesd.unwatched")
     assert ack["was_watching"] is True
 
-    # Now drive a turn; the watcher should NOT see claude.result.
+    # Now drive a turn; the watcher should NOT see agent.result.
     await owner.send(
         {
-            "type": "claude.user",
+            "type": "agent.user",
             "session_id": "u",
             "message": {"role": "user", "content": "go"},
         }
     )
-    await owner.wait_for(lambda e: e.get("type") == "claude.result" and e.get("session_id") == "u")
+    await owner.wait_for(lambda e: e.get("type") == "agent.result" and e.get("session_id") == "u")
     # Give event propagation a beat, then confirm the watcher queue is idle.
     await asyncio.sleep(0.1)
     try:
         evt = await watcher.recv(timeout=0.2)
-        assert evt.get("type") != "claude.result", f"unexpected frame {evt}"
+        assert evt.get("type") != "agent.result", f"unexpected frame {evt}"
     except TimeoutError:
         pass
 
@@ -593,7 +987,15 @@ async def test_session_info_unknown_session_errors(client_factory):
 async def test_session_info_accumulates_across_turns(client_factory, fake_mode):
     fake_mode("normal")
     c = await client_factory()
-    await c.send({"type": "blemeesd.open", "id": "r1", "session_id": "u", "tools": ""})
+    await c.send(
+        {
+            "type": "blemeesd.open",
+            "id": "r1",
+            "session_id": "u",
+            "backend": "claude",
+            "options": {"claude": {"tools": ""}},
+        }
+    )
     await c.wait_for(lambda e: e.get("type") == "blemeesd.opened")
 
     # Zero counters before any turn.
@@ -606,12 +1008,12 @@ async def test_session_info_accumulates_across_turns(client_factory, fake_mode):
     for i in range(3):
         await c.send(
             {
-                "type": "claude.user",
+                "type": "agent.user",
                 "session_id": "u",
                 "message": {"role": "user", "content": f"hi {i}"},
             }
         )
-        await c.wait_for(lambda e: e.get("type") == "claude.result" and e.get("session_id") == "u")
+        await c.wait_for(lambda e: e.get("type") == "agent.result" and e.get("session_id") == "u")
 
     await c.send({"type": "blemeesd.session_info", "id": "i1", "session_id": "u"})
     info = await c.wait_for(lambda e: e.get("type") == "blemeesd.session_info_reply")
@@ -685,18 +1087,26 @@ async def test_session_info_survives_daemon_restart(tmp_path, monkeypatch):
     t1 = asyncio.create_task(d1.serve_forever())
     try:
         w, send, wait_for = await _connect(sock1)
-        await send({"type": "blemeesd.open", "id": "r1", "session_id": "keep", "tools": ""})
+        await send(
+            {
+                "type": "blemeesd.open",
+                "id": "r1",
+                "session_id": "keep",
+                "backend": "claude",
+                "options": {"claude": {"tools": ""}},
+            }
+        )
         await wait_for(lambda e: e.get("type") == "blemeesd.opened")
         for _ in range(2):
             await send(
                 {
-                    "type": "claude.user",
+                    "type": "agent.user",
                     "session_id": "keep",
                     "message": {"role": "user", "content": "hi"},
                 }
             )
             await wait_for(
-                lambda e: e.get("type") == "claude.result" and e.get("session_id") == "keep"
+                lambda e: e.get("type") == "agent.result" and e.get("session_id") == "keep"
             )
         w.close()
         try:
@@ -724,8 +1134,9 @@ async def test_session_info_survives_daemon_restart(tmp_path, monkeypatch):
                 "type": "blemeesd.open",
                 "id": "r2",
                 "session_id": "keep",
+                "backend": "claude",
                 "resume": True,
-                "tools": "",
+                "options": {"claude": {"tools": ""}},
             }
         )
         await wait_for(lambda e: e.get("type") == "blemeesd.opened")

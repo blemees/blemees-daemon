@@ -19,7 +19,7 @@ Usage:
 At the REPL:
 
     blemees> help
-    blemees> open new model=sonnet permission_mode=bypassPermissions
+    blemees> open new backend=claude model=sonnet permission_mode=bypassPermissions
     blemees> send <id> hello there
     blemees> interrupt <id>
     blemees> close <id> --delete
@@ -57,8 +57,10 @@ Commands — each sends one wire frame, responses are printed as they arrive:
 
   open <id|new> [k=v ...]      blemeesd.open session_id=<id> …
                                id 'new' generates a uuid
-                               k=v coerces true/false/int/json; unknown keys
-                               pass through verbatim
+                               backend=<name> picks the agent (claude|codex);
+                               default claude. All other k=v go under
+                               options.<backend>.* (use options.foo=bar to be
+                               explicit). Values coerce true/false/int/json.
   resume <id> [k=v ...]        open with resume=true (shortcut)
   close <id> [--delete]        blemeesd.close session_id=<id> delete=…
   interrupt <id>               blemeesd.interrupt session_id=<id>
@@ -66,12 +68,12 @@ Commands — each sends one wire frame, responses are printed as they arrive:
   watch <id> [last_seen_seq=N] blemeesd.watch (observer mode)
   unwatch <id>                 blemeesd.unwatch
 
-  send <id> <text...>          claude.user with message={role,user,content:text}
-  send-json <id> <json>        claude.user with message=<json>
+  send <id> <text...>          agent.user with message={role,user,content:text}
+  send-json <id> <json>        agent.user with message=<json>
   raw <json>                   send an arbitrary frame
 
   pretty on|off                pretty-print inbound JSON (default off)
-  quiet on|off                 suppress claude.stream_event spam (default off)
+  quiet on|off                 suppress agent.delta spam (default off)
 
   help                         this
   quit | exit | .q             leave the REPL
@@ -167,7 +169,7 @@ class Harness:
                 except json.JSONDecodeError:
                     await self._print_note(f"non-JSON line from daemon: {raw!r}")
                     continue
-                if self.quiet and evt.get("type") == "claude.stream_event":
+                if self.quiet and evt.get("type") == "agent.delta":
                     continue
                 await self._print_frame("in", evt)
         except asyncio.CancelledError:
@@ -229,12 +231,23 @@ class Harness:
     async def open(self, session_id: str, fields: dict[str, Any]) -> str:
         if session_id == "new":
             session_id = str(uuid.uuid4())
+        # Pull the well-known top-level keys; anything else goes under
+        # options.<backend>.*. Lets you write `open new backend=claude
+        # model=sonnet` instead of having to spell out the nesting.
+        backend = fields.pop("backend", "claude")
+        resume = fields.pop("resume", False)
+        last_seen_seq = fields.pop("last_seen_seq", None)
         frame: dict[str, Any] = {
             "type": "blemeesd.open",
             "id": _req_id(),
             "session_id": session_id,
+            "backend": backend,
+            "options": {backend: fields},
         }
-        frame.update(fields)
+        if resume:
+            frame["resume"] = True
+        if last_seen_seq is not None:
+            frame["last_seen_seq"] = last_seen_seq
         await self._send(frame)
         return session_id
 
@@ -259,7 +272,7 @@ class Harness:
     async def send_user(self, session_id: str, text: str) -> None:
         await self._send(
             {
-                "type": "claude.user",
+                "type": "agent.user",
                 "session_id": session_id,
                 "message": {"role": "user", "content": text},
             }
@@ -267,7 +280,7 @@ class Harness:
 
     async def send_user_raw(self, session_id: str, message_json: str) -> None:
         msg = json.loads(message_json)
-        await self._send({"type": "claude.user", "session_id": session_id, "message": msg})
+        await self._send({"type": "agent.user", "session_id": session_id, "message": msg})
 
     async def raw(self, payload: str) -> None:
         frame = json.loads(payload)

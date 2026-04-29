@@ -21,6 +21,7 @@ from blemees.daemon import Daemon
 from blemees.logging import configure
 
 FAKE_CLAUDE = Path(__file__).parent / "fake_claude.py"
+FAKE_CODEX = Path(__file__).parent / "fake_codex.py"
 
 
 def short_socket_path(name: str = "blemeesd") -> Path:
@@ -98,6 +99,7 @@ async def daemon_and_socket(tmp_path, argv_trace_path, monkeypatch, request):
     # path the python interpreter and injecting a wrapper. Simpler: swap
     # claude_bin to point at the fake script directly (shebang runs it).
     cfg.claude_bin = str(FAKE_CLAUDE)
+    cfg.codex_bin = str(FAKE_CODEX)
 
     logger = configure("error")
     daemon = Daemon(cfg, logger)

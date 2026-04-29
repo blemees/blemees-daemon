@@ -91,8 +91,17 @@ async def test_open_with_kv_fields(h):
     f = h.sent[-1]
     assert f["type"] == "blemeesd.open"
     assert f["session_id"] == "my-session"
-    assert f["model"] == "sonnet"
-    assert f["permission_mode"] == "bypassPermissions"
+    assert f["backend"] == "claude"
+    assert f["options"]["claude"]["model"] == "sonnet"
+    assert f["options"]["claude"]["permission_mode"] == "bypassPermissions"
+
+
+async def test_open_with_explicit_backend(h):
+    await dispatch(h, "open codex-session backend=codex model=gpt-5.2-codex sandbox=read-only")
+    f = h.sent[-1]
+    assert f["backend"] == "codex"
+    assert f["options"]["codex"]["model"] == "gpt-5.2-codex"
+    assert f["options"]["codex"]["sandbox"] == "read-only"
 
 
 async def test_open_new_generates_uuid_and_notes_it(h):
@@ -128,7 +137,7 @@ async def test_interrupt(h):
 async def test_send_text_wraps_in_user_message(h):
     await dispatch(h, "send my-session hello there")
     assert h.sent[-1] == {
-        "type": "claude.user",
+        "type": "agent.user",
         "session_id": "my-session",
         "message": {"role": "user", "content": "hello there"},
     }
@@ -139,7 +148,7 @@ async def test_send_json_uses_raw_message(h):
         h, 'send-json my-session {"role":"user","content":[{"type":"text","text":"hi"}]}'
     )
     f = h.sent[-1]
-    assert f["type"] == "claude.user"
+    assert f["type"] == "agent.user"
     assert f["message"]["content"][0] == {"type": "text", "text": "hi"}
 
 

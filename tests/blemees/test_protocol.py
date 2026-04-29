@@ -1,4 +1,4 @@
-"""Unit tests for blemees.protocol."""
+"""Unit tests for blemees.protocol (blemees/2)."""
 
 from __future__ import annotations
 
@@ -7,15 +7,18 @@ import json
 import pytest
 
 from blemees import PROTOCOL_VERSION
+from blemees.backends.claude import (
+    build_argv as build_claude_argv,
+    build_user_stdin_line,
+    validate_options as validate_claude_options,
+)
 from blemees.errors import (
     OversizeMessageError,
     ProtocolError,
+    UnknownBackendError,
     UnsafeFlagError,
 )
 from blemees.protocol import (
-    OpenMessage,
-    build_claude_argv,
-    build_user_stdin_line,
     encode,
     error_frame,
     hello_ack,
@@ -47,7 +50,7 @@ def test_encode_is_newline_terminated_utf8():
 
 
 def test_parse_line_accepts_valid_object():
-    obj = parse_line(b'{"type":"blemeesd.hello","protocol":"blemees/1"}\n')
+    obj = parse_line(b'{"type":"blemeesd.hello","protocol":"blemees/2"}\n')
     assert obj["type"] == "blemeesd.hello"
 
 
@@ -77,7 +80,6 @@ def test_parse_line_rejects_oversize():
 
 
 def test_parse_line_handles_surrogate_pairs():
-    # Emoji encoded as two UTF-16 surrogates must round-trip via JSON.
     raw = json.dumps({"type": "x", "text": "\U0001f600"}).encode("utf-8") + b"\n"
     obj = parse_line(raw)
     assert obj["text"] == "\U0001f600"
@@ -100,18 +102,18 @@ def test_parse_hello_requires_protocol():
 
 
 def test_parse_hello_ok():
-    h = parse_hello({"type": "blemeesd.hello", "protocol": "blemees/1", "client": "t/0.1"})
-    assert h.protocol == "blemees/1"
+    h = parse_hello({"type": "blemeesd.hello", "protocol": "blemees/2", "client": "t/0.1"})
+    assert h.protocol == "blemees/2"
     assert h.client == "t/0.1"
 
 
 def test_hello_ack_shape():
-    ack = hello_ack("0.1.0", 1234, "2.1.118")
+    ack = hello_ack("0.1.0", 1234, {"claude": "2.1.118", "codex": "0.125.0"})
     assert ack["type"] == "blemeesd.hello_ack"
     assert ack["daemon"] == "blemeesd/0.1.0"
     assert ack["protocol"] == PROTOCOL_VERSION
     assert ack["pid"] == 1234
-    assert ack["claude_version"] == "2.1.118"
+    assert ack["backends"] == {"claude": "2.1.118", "codex": "0.125.0"}
 
 
 # ---------------------------------------------------------------------------
@@ -119,72 +121,137 @@ def test_hello_ack_shape():
 # ---------------------------------------------------------------------------
 
 
+def _open_frame(**overrides):
+    """Helper for the canonical claude open frame."""
+    base = {
+        "type": "blemeesd.open",
+        "session_id": "s1",
+        "backend": "claude",
+        "options": {"claude": {}},
+    }
+    base.update(overrides)
+    return base
+
+
+def test_parse_open_minimal_claude():
+    msg = parse_open(_open_frame())
+    assert msg.session_id == "s1"
+    assert msg.backend == "claude"
+    assert msg.options == {}
+    assert msg.resume is False
+
+
 def test_parse_open_requires_session():
     with pytest.raises(ProtocolError):
-        parse_open({"type": "blemeesd.open"})
+        parse_open({"type": "blemeesd.open", "backend": "claude", "options": {"claude": {}}})
 
 
-def test_parse_open_rejects_unsafe_flag_field():
-    with pytest.raises(UnsafeFlagError):
+def test_parse_open_requires_backend():
+    with pytest.raises(ProtocolError):
+        parse_open({"type": "blemeesd.open", "session_id": "s1", "options": {}})
+
+
+def test_parse_open_rejects_unknown_backend():
+    with pytest.raises(UnknownBackendError):
         parse_open(
             {
                 "type": "blemeesd.open",
                 "session_id": "s1",
-                "dangerously_skip_permissions": True,
+                "backend": "anthropic",
+                "options": {},
             }
         )
 
 
-def test_parse_open_rejects_unsafe_flag_literal_in_values():
-    with pytest.raises(UnsafeFlagError):
+def test_parse_open_rejects_top_level_legacy_field():
+    with pytest.raises(ProtocolError):
+        parse_open(_open_frame(model="sonnet"))
+
+
+def test_parse_open_resume_flag():
+    msg = parse_open(_open_frame(resume=True))
+    assert msg.resume is True
+
+
+def test_parse_open_last_seen_seq():
+    msg = parse_open(_open_frame(last_seen_seq=42))
+    assert msg.last_seen_seq == 42
+
+
+def test_parse_open_rejects_negative_last_seen_seq():
+    with pytest.raises(ProtocolError):
+        parse_open(_open_frame(last_seen_seq=-1))
+
+
+def test_parse_open_rejects_sibling_options_block():
+    with pytest.raises(ProtocolError):
         parse_open(
             {
                 "type": "blemeesd.open",
                 "session_id": "s1",
-                "disallowed_tools": ["--dangerously-skip-permissions"],
+                "backend": "claude",
+                "options": {"claude": {}, "anthropic": {}},
             }
         )
 
 
-def test_parse_open_rejects_client_set_input_format():
-    with pytest.raises(ProtocolError) as exc:
-        parse_open(
-            {
-                "type": "blemeesd.open",
-                "session_id": "s1",
-                "input_format": "text",
-            }
-        )
-    assert "input_format" in str(exc.value)
-
-
-def test_parse_open_rejects_client_set_output_format():
-    with pytest.raises(ProtocolError) as exc:
-        parse_open(
-            {
-                "type": "blemeesd.open",
-                "session_id": "s1",
-                "output_format": "json",
-            }
-        )
-    assert "output_format" in str(exc.value)
-
-
-def test_parse_open_allows_bypass_permissions_mode():
-    # Explicitly allowed by spec §5.4.
+def test_parse_open_extracts_chosen_backend_options():
     msg = parse_open(
         {
             "type": "blemeesd.open",
             "session_id": "s1",
-            "permission_mode": "bypassPermissions",
+            "backend": "claude",
+            "options": {"claude": {"model": "sonnet", "tools": ""}},
         }
     )
-    assert msg.fields["permission_mode"] == "bypassPermissions"
+    assert msg.options == {"model": "sonnet", "tools": ""}
+
+
+# ---------------------------------------------------------------------------
+# options.claude validation (lives in backends/claude.py now, but the
+# daemon's open path runs it before spawn — so it's part of the wire
+# contract).
+# ---------------------------------------------------------------------------
+
+
+def test_validate_claude_options_rejects_unsafe_flag_field():
+    with pytest.raises(UnsafeFlagError):
+        validate_claude_options({"dangerously_skip_permissions": True})
+
+
+def test_validate_claude_options_rejects_unsafe_flag_literal_in_values():
+    with pytest.raises(UnsafeFlagError):
+        validate_claude_options({"disallowed_tools": ["--dangerously-skip-permissions"]})
+
+
+def test_validate_claude_options_rejects_input_format():
+    with pytest.raises(ProtocolError) as exc:
+        validate_claude_options({"input_format": "text"})
+    assert "input_format" in str(exc.value)
+
+
+def test_validate_claude_options_rejects_output_format():
+    with pytest.raises(ProtocolError) as exc:
+        validate_claude_options({"output_format": "json"})
+    assert "output_format" in str(exc.value)
+
+
+def test_validate_claude_options_allows_bypass_permissions_mode():
+    validate_claude_options({"permission_mode": "bypassPermissions"})
+
+
+def test_validate_claude_options_rejects_unknown_key():
+    with pytest.raises(ProtocolError):
+        validate_claude_options({"not_a_real_field": True})
+
+
+# ---------------------------------------------------------------------------
+# build_argv
+# ---------------------------------------------------------------------------
 
 
 def test_build_argv_default_flags_and_session_id():
-    msg = OpenMessage(id=None, session_id="s1", resume=False, fields={"session_id": "s1"})
-    argv = build_claude_argv("claude", msg)
+    argv = build_claude_argv("claude", session_id="s1", options={}, for_resume=False)
     assert argv[:3] == ["claude", "-p", "--verbose"]
     assert "--session-id" in argv
     assert argv[argv.index("--session-id") + 1] == "s1"
@@ -193,32 +260,20 @@ def test_build_argv_default_flags_and_session_id():
 
 
 def test_build_argv_resume_replaces_session_id():
-    msg = OpenMessage(id=None, session_id="s1", resume=True, fields={"session_id": "s1"})
-    argv = build_claude_argv("claude", msg)
+    argv = build_claude_argv("claude", session_id="s1", options={}, for_resume=True)
     assert "--resume" in argv
     assert argv[argv.index("--resume") + 1] == "s1"
     assert "--session-id" not in argv
 
 
-def test_build_argv_for_resume_flag_forces_resume():
-    msg = OpenMessage(id=None, session_id="s1", resume=False, fields={"session_id": "s1"})
-    argv = build_claude_argv("claude", msg, for_resume=True)
-    assert "--resume" in argv
-    assert "--session-id" not in argv
-
-
 def test_build_argv_tools_empty_string_disables_all():
-    msg = OpenMessage(
-        id=None, session_id="s1", resume=False, fields={"session_id": "s1", "tools": ""}
-    )
-    argv = build_claude_argv("claude", msg)
+    argv = build_claude_argv("claude", session_id="s1", options={"tools": ""}, for_resume=False)
     i = argv.index("--tools")
     assert argv[i + 1] == ""
 
 
 def test_build_argv_maps_many_fields():
-    fields = {
-        "session_id": "s1",
+    options = {
         "model": "sonnet",
         "system_prompt": "sp",
         "append_system_prompt": "asp",
@@ -244,8 +299,7 @@ def test_build_argv_maps_many_fields():
         "include_partial_messages": True,
         "replay_user_messages": True,
     }
-    msg = OpenMessage(id=None, session_id="s1", resume=False, fields=fields)
-    argv = build_claude_argv("claude", msg)
+    argv = build_claude_argv("claude", session_id="s1", options=options, for_resume=False)
     joined = " ".join(argv)
     assert "--model sonnet" in joined
     assert "--system-prompt sp" in joined
@@ -273,22 +327,21 @@ def test_build_argv_maps_many_fields():
 
 
 def test_build_argv_unset_fields_omit_flags():
-    msg = OpenMessage(id=None, session_id="s1", resume=False, fields={"session_id": "s1"})
-    argv = build_claude_argv("claude", msg)
+    argv = build_claude_argv("claude", session_id="s1", options={}, for_resume=False)
     assert "--model" not in argv
     assert "--system-prompt" not in argv
     assert "--tools" not in argv
 
 
 # ---------------------------------------------------------------------------
-# user / interrupt / close
+# user / interrupt / close (agent.user envelope)
 # ---------------------------------------------------------------------------
 
 
 def test_parse_user_message_string_content():
     u = parse_user(
         {
-            "type": "claude.user",
+            "type": "agent.user",
             "session_id": "s1",
             "message": {"role": "user", "content": "hello"},
         }
@@ -300,7 +353,7 @@ def test_parse_user_message_list_content():
     blocks = [{"type": "text", "text": "hi"}]
     u = parse_user(
         {
-            "type": "claude.user",
+            "type": "agent.user",
             "session_id": "s1",
             "message": {"role": "user", "content": blocks},
         }
@@ -310,19 +363,19 @@ def test_parse_user_message_list_content():
 
 def test_parse_user_rejects_missing_message():
     with pytest.raises(ProtocolError):
-        parse_user({"type": "claude.user", "session_id": "s1"})
+        parse_user({"type": "agent.user", "session_id": "s1"})
 
 
 def test_parse_user_rejects_legacy_text_shorthand():
     with pytest.raises(ProtocolError):
-        parse_user({"type": "claude.user", "session_id": "s1", "text": "hello"})
+        parse_user({"type": "agent.user", "session_id": "s1", "text": "hello"})
 
 
 def test_parse_user_rejects_non_user_role():
     with pytest.raises(ProtocolError):
         parse_user(
             {
-                "type": "claude.user",
+                "type": "agent.user",
                 "session_id": "s1",
                 "message": {"role": "assistant", "content": "x"},
             }
@@ -333,7 +386,7 @@ def test_parse_user_rejects_non_string_non_list_content():
     with pytest.raises(ProtocolError):
         parse_user(
             {
-                "type": "claude.user",
+                "type": "agent.user",
                 "session_id": "s1",
                 "message": {"role": "user", "content": 42},
             }
@@ -345,7 +398,6 @@ def test_build_user_stdin_line_envelope_only():
     line = build_user_stdin_line("s1", message=message)
     obj = json.loads(line)
     assert obj == {"type": "user", "message": message, "session_id": "s1"}
-    # And the message dict is the very same (reference-preserving pass-through).
     assert obj["message"] == message
     assert line.endswith(b"\n")
 
@@ -402,16 +454,18 @@ def test_parse_list_sessions_ok():
 
 
 def test_error_frame_includes_optional_fields():
-    frame = error_frame("invalid_message", "oops", id="req_1", session_id="s1")
+    frame = error_frame("invalid_message", "oops", id="req_1", session_id="s1", backend="claude")
     assert frame["code"] == "invalid_message"
     assert frame["id"] == "req_1"
     assert frame["session_id"] == "s1"
+    assert frame["backend"] == "claude"
 
 
 def test_error_frame_omits_unset_ids():
     frame = error_frame("internal", "bad")
     assert "id" not in frame
     assert "session_id" not in frame
+    assert "backend" not in frame
 
 
 # ---------------------------------------------------------------------------
@@ -452,14 +506,14 @@ def test_parse_status_rejects_extra_keys():
 
 def test_parse_hello_rejects_extra_keys():
     with pytest.raises(ProtocolError, match="unexpected field"):
-        parse_hello({"type": "blemeesd.hello", "protocol": "blemees/1", "unknown": True})
+        parse_hello({"type": "blemeesd.hello", "protocol": "blemees/2", "unknown": True})
 
 
 def test_parse_user_rejects_extra_keys():
     with pytest.raises(ProtocolError, match="unexpected field"):
         parse_user(
             {
-                "type": "claude.user",
+                "type": "agent.user",
                 "session_id": "s1",
                 "message": {"role": "user", "content": "hi"},
                 "extra": "oops",
@@ -497,13 +551,6 @@ def test_parse_session_info_rejects_extra_keys():
         parse_session_info({"type": "blemeesd.session_info", "session_id": "s1", "extra": 1})
 
 
-def test_parse_open_tolerates_extra_keys():
-    # blemeesd.open uses additionalProperties: true — unknown keys must pass through.
-    msg = parse_open(
-        {
-            "type": "blemeesd.open",
-            "session_id": "s1",
-            "unknown_flag": "value",
-        }
-    )
-    assert msg.session_id == "s1"
+def test_parse_open_rejects_extra_keys():
+    with pytest.raises(ProtocolError, match="unexpected field"):
+        parse_open(_open_frame(unknown_flag="value"))

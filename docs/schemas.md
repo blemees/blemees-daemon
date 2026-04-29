@@ -8,9 +8,11 @@ permalink: /schemas/
 
 # blemees — wire-frame JSON Schemas
 
-Machine-readable contract for every frame on the `blemees/1` protocol.
-The prose spec is the repository root `README.md`; the schemas in this
-directory formalize the frame shapes referenced there.
+Machine-readable contract for every frame on the `blemees/2` protocol.
+The prose spec is the repository root `README.md`; the unified
+`agent.*` event vocabulary is locked in
+[`docs/agent-events.md`](../../docs/agent-events.md). The schemas in
+this directory formalize the frame shapes referenced there.
 
 These ship inside the `blemees` wheel as the `blemees.schemas`
 subpackage, so installed clients can validate frames without copying
@@ -28,7 +30,7 @@ root = files()                                # importlib.resources Traversable
 
 ```
 blemees/schemas/
-  _common.json               # shared $defs (SessionId, Seq, MessageContent, …)
+  _common.json               # shared $defs (SessionId, Seq, Backend, AgentUserMessage, NormalisedUsage, …)
   inbound/                   # client → daemon frames
     blemeesd.hello.json
     blemeesd.open.json
@@ -40,7 +42,9 @@ blemees/schemas/
     blemeesd.watch.json
     blemeesd.unwatch.json
     blemeesd.session_info.json
-    claude.user.json
+    options.claude.json      # per-backend options consumed by blemeesd.open
+    options.codex.json
+    agent.user.json          # client user-turn (backend-neutral)
   outbound/                  # daemon → client frames
     blemeesd.hello_ack.json
     blemeesd.opened.json
@@ -56,25 +60,31 @@ blemees/schemas/
     blemeesd.watching.json
     blemeesd.unwatched.json
     blemeesd.session_info_reply.json
-    claude.event.json        # envelope for every forwarded CC event
+    agent.event.json         # unified envelope for every translated agent.* event
 ```
 
 ## Draft / compatibility rules
 
 * **Draft**: JSON Schema `2020-12` (via `$schema`).
 * **Inbound frames** are strict (`additionalProperties: false`) — the
-  daemon rejects unknown fields with `invalid_message`. Fields the
-  daemon owns (`input_format`, `output_format`) and the legacy unsafe
-  flags (`dangerously_skip_permissions`, …) are refused explicitly via
-  a `not` clause on `blemeesd.open`.
+  daemon rejects unknown fields with `invalid_message`. The
+  per-backend `options.<backend>` schemas inherit this strictness, so
+  unknown knobs inside `options.claude` / `options.codex` are
+  rejected too. Reserved unsafe fields under `options.claude` (legacy
+  `dangerously_skip_permissions`, `--bare`, `--continue`, etc.) are
+  refused via a `not` clause.
 * **Outbound frames** permit `additionalProperties: true` so the daemon
   can grow the envelope (e.g. new debug fields) without breaking
   conforming clients.
-* **`claude.*` events** use a loose envelope
-  (`schemas/outbound/claude.event.json`) — only `type`, `session_id`, and
-  `seq` are constrained; the inner CC payload (`message`, `event`,
-  `result`, …) is not validated here, because Claude Code owns that
-  schema and we are pass-through.
+* **`agent.*` events** use a single envelope schema
+  (`schemas/outbound/agent.event.json`) with `if/then` branches per
+  type. The eight types — `agent.system_init`, `agent.delta`,
+  `agent.message`, `agent.user_echo`, `agent.tool_use`,
+  `agent.tool_result`, `agent.notice`, `agent.result` — each carry
+  the common envelope (`type`, `session_id`, `seq`, `backend`) plus
+  type-specific required fields. Inner shapes (`content` arrays,
+  tool `input`/`output`, `agent.notice.data`) stay permissive so
+  future fields pass through.
 
 ## Use
 
@@ -113,7 +123,9 @@ these schemas into typed models in most languages.
 
 ## Versioning
 
-Breaking changes to any frame shape bump the protocol version (`blemees/1`
-→ `blemees/2`); the daemon rejects old versions on `blemeesd.hello`
-with `code: protocol_mismatch`. Additive, backward-compatible changes
-stay on the same version.
+Breaking changes to any frame shape bump the protocol version
+(`blemees/2` → `blemees/3`); the daemon rejects old versions on
+`blemeesd.hello` with `code: protocol_mismatch`. Additive,
+backward-compatible changes stay on the same version. The daemon
+supports a single protocol version at a time — pre-1.0 has no
+compatibility shim for `blemees/1`.

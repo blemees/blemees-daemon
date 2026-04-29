@@ -65,33 +65,40 @@ async def _client(socket_path: str):
     return c
 
 
-async def test_real_claude_turn_produces_result(real_daemon):
-    c = await _client(real_daemon)
-    try:
-        session = str(uuid.uuid4())
-        await c.send(
-            {
-                "type": "blemeesd.open",
-                "id": "r1",
-                "session_id": session,
+def _open_claude(session: str) -> dict:
+    return {
+        "type": "blemeesd.open",
+        "id": "r1",
+        "session_id": session,
+        "backend": "claude",
+        "options": {
+            "claude": {
                 "model": "haiku",
                 "tools": "",
                 "permission_mode": "bypassPermissions",
             }
-        )
+        },
+    }
+
+
+async def test_real_claude_turn_produces_result(real_daemon):
+    c = await _client(real_daemon)
+    try:
+        session = str(uuid.uuid4())
+        await c.send(_open_claude(session))
         await c.wait_for(lambda e: e.get("type") == "blemeesd.opened", timeout=30.0)
         await c.send(
             {
-                "type": "claude.user",
+                "type": "agent.user",
                 "session_id": session,
                 "message": {"role": "user", "content": "Say OK."},
             }
         )
         res = await c.wait_for(
-            lambda e: e.get("type") == "claude.result" and e.get("session_id") == session,
+            lambda e: e.get("type") == "agent.result" and e.get("session_id") == session,
             timeout=60.0,
         )
-        assert res["subtype"] in {"success", "error_max_turns", "error_during_execution"}
+        assert res["subtype"] in {"success", "error", "interrupted"}
     finally:
         await c.close()
 
@@ -100,31 +107,22 @@ async def test_real_claude_resume_preserves_context(real_daemon):
     c = await _client(real_daemon)
     try:
         session = str(uuid.uuid4())
-        await c.send(
-            {
-                "type": "blemeesd.open",
-                "id": "r1",
-                "session_id": session,
-                "model": "haiku",
-                "tools": "",
-                "permission_mode": "bypassPermissions",
-            }
-        )
+        await c.send(_open_claude(session))
         await c.wait_for(lambda e: e.get("type") == "blemeesd.opened", timeout=30.0)
         await c.send(
             {
-                "type": "claude.user",
+                "type": "agent.user",
                 "session_id": session,
                 "message": {"role": "user", "content": "Remember the number 17."},
             }
         )
         await c.wait_for(
-            lambda e: e.get("type") == "claude.result" and e.get("session_id") == session,
+            lambda e: e.get("type") == "agent.result" and e.get("session_id") == session,
             timeout=60.0,
         )
         await c.send(
             {
-                "type": "claude.user",
+                "type": "agent.user",
                 "session_id": session,
                 "message": {
                     "role": "user",
@@ -133,18 +131,24 @@ async def test_real_claude_resume_preserves_context(real_daemon):
             }
         )
         collected = await c.wait_for(
-            lambda e: e.get("type") == "claude.result" and e.get("session_id") == session,
+            lambda e: e.get("type") == "agent.result" and e.get("session_id") == session,
             collect=True,
             timeout=60.0,
         )
-        # Concatenate any text from assistant messages seen.
         text = ""
         for evt in collected:
-            if evt.get("type") == "claude.assistant":
-                for block in evt.get("message", {}).get("content", []):
+            if evt.get("type") == "agent.message":
+                # blemees/2 puts the content list at the top level of
+                # `agent.message`; the legacy shape (`message.content`)
+                # is kept as a fallback for forward-compat readers.
+                blocks = evt.get("content") or evt.get("message", {}).get("content", [])
+                for block in blocks:
                     if isinstance(block, dict) and block.get("type") == "text":
                         text += block.get("text", "")
-        assert "17" in text
+        assert "17" in text, (
+            f"resumed turn lost context: text={text!r} "
+            f"frames={[(e.get('type'), e.get('subtype')) for e in collected]}"
+        )
     finally:
         await c.close()
 
@@ -153,20 +157,11 @@ async def test_real_claude_interrupt_then_continue(real_daemon):
     c = await _client(real_daemon)
     try:
         session = str(uuid.uuid4())
-        await c.send(
-            {
-                "type": "blemeesd.open",
-                "id": "r1",
-                "session_id": session,
-                "model": "haiku",
-                "tools": "",
-                "permission_mode": "bypassPermissions",
-            }
-        )
+        await c.send(_open_claude(session))
         await c.wait_for(lambda e: e.get("type") == "blemeesd.opened", timeout=30.0)
         await c.send(
             {
-                "type": "claude.user",
+                "type": "agent.user",
                 "session_id": session,
                 "message": {
                     "role": "user",
@@ -174,20 +169,27 @@ async def test_real_claude_interrupt_then_continue(real_daemon):
                 },
             }
         )
-        await c.wait_for(lambda e: e.get("type") == "claude.stream_event", timeout=60.0)
+        # claude -p emits an agent.system_init then an agent.delta /
+        # agent.message once the model starts. We accept either as the
+        # signal that the turn is in flight (some configurations
+        # buffer the first chunk into a single agent.message).
+        await c.wait_for(
+            lambda e: e.get("type") in {"agent.delta", "agent.message"},
+            timeout=120.0,
+        )
         await c.send({"type": "blemeesd.interrupt", "session_id": session})
-        await c.wait_for(lambda e: e.get("type") == "blemeesd.interrupted", timeout=10.0)
-        # Subsequent turn still works.
+        await c.wait_for(lambda e: e.get("type") == "blemeesd.interrupted", timeout=15.0)
+        # Subsequent turn still works (claude respawns with --resume).
         await c.send(
             {
-                "type": "claude.user",
+                "type": "agent.user",
                 "session_id": session,
                 "message": {"role": "user", "content": "Say OK."},
             }
         )
         await c.wait_for(
-            lambda e: e.get("type") == "claude.result" and e.get("session_id") == session,
-            timeout=60.0,
+            lambda e: e.get("type") == "agent.result" and e.get("session_id") == session,
+            timeout=120.0,
         )
     finally:
         await c.close()

@@ -8,8 +8,8 @@
     "type": { "const": "blemeesd.hello" },
     "protocol": {
       "type": "string",
-      "description": "Protocol version. v0.1 speaks `blemees/1`.",
-      "const": "blemees/1"
+      "description": "Protocol version. v0.1 speaks `blemees/2`. The daemon supports a single version at a time; pre-1.0 has no compatibility shim for `blemees/1`.",
+      "const": "blemees/2"
     },
     "client": {
       "type": "string",

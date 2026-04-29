@@ -29,10 +29,28 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .backends import AgentBackend
+from .backends.claude import session_file_path as _claude_session_file_path
 from .errors import SessionExistsError, SessionUnknownError
 from .event_log import DurableEventLog, RingBuffer, event_log_path
 from .protocol import OpenMessage
-from .subprocess import ClaudeSubprocess, session_file_path
+
+
+def _session_transcript_path(sess: Session) -> Path | None:
+    """Resolve the on-disk transcript path for a session.
+
+    For Claude the path is derived from cwd + session id. For Codex we
+    cache the rollout path on the session at ``agent.system_init`` time
+    (it lives under ``~/.codex/sessions/YYYY/MM/DD/rollout-…jsonl``);
+    we just return the cached value here.
+    """
+    if sess.backend_name == "claude":
+        return _claude_session_file_path(sess.cwd, sess.session_id)
+    if sess.backend_name == "codex":
+        if sess.rollout_path:
+            return Path(sess.rollout_path)
+    return None
+
 
 WriterFn = Callable[[dict], Awaitable[None]]
 
@@ -42,9 +60,24 @@ class Session:
     session_id: str
     open_msg: OpenMessage
     cwd: str | None
+    backend_name: str = "claude"
     connection_id: int | None = None
-    subprocess: ClaudeSubprocess | None = None
+    backend: AgentBackend | None = None
     detached_at: float | None = None
+
+    # Backend-side session identifier surfaced on `agent.system_init`.
+    # Equal to ``session_id`` for the Claude backend; the Codex
+    # ``threadId`` for Codex (only known after the first turn produces
+    # ``session_configured``). Used by:
+    #   * ``blemeesd.opened.native_session_id`` (omitted until known).
+    #   * ``CodexBackend`` on resume so the first ``tools/call`` routes
+    #     through ``codex-reply`` with the cached id.
+    native_session_id: str | None = None
+    # Rollout transcript path Codex writes to (carried on
+    # ``agent.system_init.capabilities.rollout_path``). Cached so
+    # ``blemeesd.close{delete:true}`` can unlink it without re-scanning
+    # the rollout directory.
+    rollout_path: str | None = None
 
     # Event-stream state -------------------------------------------------
     seq: int = 0
@@ -54,12 +87,12 @@ class Session:
     _finishing: bool = False  # subprocess keeps running, kill on next result
 
     # Non-driving subscribers: connection_id → writer. Watchers receive every
-    # frame the primary writer gets (claude.* events, blemeesd.stderr,
-    # blemeesd.error{claude_crashed,oauth_expired}, and replays on subscribe)
+    # frame the primary writer gets (agent.* events, blemeesd.stderr,
+    # blemeesd.error{backend_crashed,auth_failed}, and replays on subscribe)
     # but cannot drive the session (user/interrupt/close).
     _watchers: dict[int, WriterFn] = field(default_factory=dict)
 
-    # Running usage accumulator maintained from claude.result frames. Persists
+    # Running usage accumulator maintained from agent.result frames. Persists
     # to <event_log_dir>/<session>.usage.json so it survives daemon restarts
     # whenever the durable log is enabled.
     turns: int = 0
@@ -83,12 +116,17 @@ class Session:
     # ------------------------------------------------------------------
 
     async def on_event(self, frame: dict) -> None:
-        """Called by :class:`ClaudeSubprocess` for every event it emits.
+        """Called by the backend for every event it emits.
 
-        Tags with ``seq``, appends to the ring + durable log, and pushes
-        to the attached writer (if any). If we're in ``finishing`` mode
-        and this is the turn-ending ``result``, schedule a clean kill.
+        Tags with ``session_id`` and ``seq``, appends to the ring + durable
+        log, and pushes to the attached writer (if any). If we're in
+        ``finishing`` mode and this is the turn-ending ``agent.result``,
+        schedule a clean kill.
         """
+        # Backends emit translator output without session_id; layering it on
+        # here keeps the translator stateless and gives us one place that owns
+        # the session-tagging contract.
+        frame.setdefault("session_id", self.session_id)
         self.seq += 1
         frame["seq"] = self.seq
         self.ring.append(frame)
@@ -117,13 +155,13 @@ class Session:
                     dead.append(conn_id)
             for conn_id in dead:
                 self._watchers.pop(conn_id, None)
-        # Soft-kill after a completed turn when the client has left. We
-        # match on the namespaced form emitted by the subprocess reader.
-        if self._finishing and frame.get("type") == "claude.result":
+        # Soft-kill after a completed turn when the client has left.
+        # Backends emit `agent.result` as the turn-ending frame.
+        if self._finishing and frame.get("type") == "agent.result":
             self._finishing = False
-            sub = self.subprocess
+            sub = self.backend
             if sub is not None:
-                asyncio.create_task(sub.close(), name=f"cc-soft-kill-{self.session_id}")
+                asyncio.create_task(sub.close(), name=f"backend-soft-kill-{self.session_id}")
 
     # ------------------------------------------------------------------
     # Attach / detach
@@ -272,30 +310,41 @@ class Session:
     # ------------------------------------------------------------------
 
     def _update_usage_from_frame(self, frame: dict) -> None:
-        """Pull model / usage out of relevant CC events. Persist if enabled."""
+        """Pull model / usage out of normalised agent.* events. Persist if enabled."""
         t = frame.get("type")
-        if t == "claude.system" and frame.get("subtype") == "init":
+        if t == "agent.system_init":
             model = frame.get("model")
             if isinstance(model, str):
                 self.last_model = model
+            native = frame.get("native_session_id")
+            if isinstance(native, str) and native:
+                self.native_session_id = native
+            caps = frame.get("capabilities")
+            if isinstance(caps, dict):
+                rollout = caps.get("rollout_path")
+                if isinstance(rollout, str) and rollout:
+                    self.rollout_path = rollout
+            # Persist so resume across daemon restarts can recover both.
+            self._save_usage_sidecar()
             return
-        if t != "claude.result":
+        if t != "agent.result":
             return
         usage = frame.get("usage")
         if not isinstance(usage, dict):
             return
-        # Snapshot last-turn usage verbatim so clients see whatever fields CC
-        # emits (including future ones we don't know about yet).
+        # Snapshot last-turn usage verbatim so clients see whatever fields a
+        # backend emits (including future ones we don't know about yet).
         self.last_turn_usage = dict(usage)
         for key in (
             "input_tokens",
             "output_tokens",
             "cache_read_input_tokens",
             "cache_creation_input_tokens",
+            "reasoning_output_tokens",
         ):
-            self.cumulative_usage[key] = self.cumulative_usage.get(key, 0) + int(
-                usage.get(key, 0) or 0
-            )
+            v = usage.get(key)
+            if isinstance(v, int):
+                self.cumulative_usage[key] = self.cumulative_usage.get(key, 0) + v
         self.turns += 1
         self.last_turn_at_ms = int(time.time() * 1000)
         self._save_usage_sidecar()
@@ -309,6 +358,7 @@ class Session:
         )
         return {
             "session_id": self.session_id,
+            "backend": self.backend_name,
             "model": self.last_model,
             "cwd": self.cwd,
             "turns": self.turns,
@@ -333,6 +383,8 @@ class Session:
             "last_turn_at_ms": self.last_turn_at_ms,
             "last_turn_usage": self.last_turn_usage,
             "cumulative_usage": self.cumulative_usage,
+            "native_session_id": self.native_session_id,
+            "rollout_path": self.rollout_path,
         }
         try:
             self._usage_path.parent.mkdir(parents=True, exist_ok=True)
@@ -363,6 +415,10 @@ class Session:
             for k, v in data["cumulative_usage"].items():
                 if isinstance(v, int):
                     self.cumulative_usage[k] = v
+        if isinstance(data.get("native_session_id"), str):
+            self.native_session_id = data["native_session_id"]
+        if isinstance(data.get("rollout_path"), str):
+            self.rollout_path = data["rollout_path"]
 
 
 # ---------------------------------------------------------------------------
@@ -395,7 +451,8 @@ class SessionTable:
         sess = Session(
             session_id=open_msg.session_id,
             open_msg=open_msg,
-            cwd=open_msg.fields.get("cwd"),
+            cwd=open_msg.options.get("cwd"),
+            backend_name=open_msg.backend,
             ring=RingBuffer(self.ring_buffer_size),
         )
         if self.event_log_dir:
@@ -426,11 +483,11 @@ class SessionTable:
         return [s for s in self._sessions.values() if s.cwd == cwd]
 
     def iter_with_active_turn(self) -> list[Session]:
-        """Sessions whose subprocess is running and has a turn in flight."""
+        """Sessions whose backend is running and has a turn in flight."""
         return [
             s
             for s in self._sessions.values()
-            if s.subprocess is not None and s.subprocess.running and s.subprocess.turn_active
+            if s.backend is not None and s.backend.running and s.backend.turn_active
         ]
 
     # ------------------------------------------------------------------
@@ -443,15 +500,15 @@ class SessionTable:
         if sess is None:
             return
         sess.detach_writer()
-        sub = sess.subprocess
+        sub = sess.backend
         if sub is None or not sub.running:
-            sess.subprocess = None
+            sess.backend = None
             return
         if sub.turn_active:
             sess.mark_finishing()
         else:
             await sub.close()
-            sess.subprocess = None
+            sess.backend = None
 
     async def detach_all_for_connection(self, connection_id: int) -> list[str]:
         detached: list[str] = []
@@ -477,8 +534,8 @@ class SessionTable:
             sess = self._sessions.pop(session_id, None)
         if sess is None:
             return
-        if sess.subprocess is not None:
-            await sess.subprocess.close()
+        if sess.backend is not None:
+            await sess.backend.close()
         if sess.log is not None:
             if delete_file:
                 sess.log.unlink()
@@ -486,8 +543,8 @@ class SessionTable:
                 sess.log.close()
         if delete_file:
             try:
-                path = session_file_path(sess.cwd, sess.session_id)
-                if path.is_file():
+                path = _session_transcript_path(sess)
+                if path is not None and path.is_file():
                     path.unlink()
             except OSError:
                 pass

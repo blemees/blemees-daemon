@@ -1,39 +1,47 @@
-"""Wrapper around a long-running ``claude -p`` child (spec §6).
+"""Claude Code backend (`claude -p`).
+
+Wraps a long-running `claude -p` child, drives it through CC's
+stream-json stdio, and translates each native event into one or more
+`agent.*` frames via :mod:`blemees.backends.translate_claude`.
 
 Responsibilities:
-    * Spawn and respawn (``--resume``) the child with a fixed argv template.
-    * Feed ``claude.user`` turns to stdin.
-    * Parse stdout stream-json events; inject ``"session_id"`` and enqueue to the
-      connection event queue.
-    * Rate-limit stderr lines, detect OAuth-expiry signatures, surface
-      ``claude_crashed`` on non-zero exit mid-turn.
-    * Interrupt: SIGTERM → 500 ms → SIGKILL, then respawn with ``--resume``.
+    * Spawn / respawn (`--resume`) the child with a fixed argv template.
+    * Feed `agent.user` turns to stdin in CC's stream-json input shape.
+    * Parse stdout stream-json events; translate each to agent.* frames;
+      enqueue to the per-session event pipeline.
+    * Rate-limit stderr lines, detect auth-failure signatures, surface
+      `backend_crashed` on non-zero exit mid-turn.
+    * Interrupt: SIGTERM → 500 ms → SIGKILL, then respawn with `--resume`.
 
-The wrapper is agnostic to the connection/session layer: it just needs an
-``asyncio.Queue`` to push frames onto. That queue is the per-connection
-bounded event queue described in §9.3.
+The wrapper is agnostic to the connection/session layer: it just needs
+an `EventCallback` to push frames onto. That callback is the per-session
+event pipeline described in spec §5.6 / §9.3.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 import signal
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from .errors import (
-    CLAUDE_CRASHED,
-    OAUTH_EXPIRED,
+from ..errors import (
+    AUTH_FAILED,
+    BACKEND_CRASHED,
     SessionBusyError,
     SpawnFailedError,
+    UnsafeFlagError,
 )
+from . import EventCallback
+from .translate_claude import TURN_END_TYPES, translate_event
 
 # Signatures that indicate the CLI's OAuth token has expired. Spec §9.2.
-_OAUTH_PATTERNS = (
+_AUTH_FAIL_PATTERNS: tuple[str, ...] = (
     "401",
     "OAuth token expired",
     "Please run claude auth",
@@ -62,8 +70,10 @@ class _StderrRateLimiter:
         return True
 
 
-class ClaudeSubprocess:
+class ClaudeBackend:
     """One child process running ``claude -p --output-format stream-json``."""
+
+    backend = "claude"
 
     def __init__(
         self,
@@ -71,26 +81,26 @@ class ClaudeSubprocess:
         session_id: str,
         argv: list[str],
         cwd: str | None,
-        on_event: Callable[[dict], Awaitable[None]],
+        on_event: EventCallback,
         logger,
         stderr_rate_lines: int = 50,
         stderr_rate_window_s: float = 10.0,
-        on_exit: Callable[[ClaudeSubprocess], Awaitable[None]] | None = None,
+        include_raw_events: bool = False,
     ) -> None:
         self.session_id = session_id
         self._argv = argv
         self._cwd = cwd
         self._on_event = on_event
-        self._log = logger.bind(session_id=session_id)
+        self._log = logger.bind(session_id=session_id, backend=self.backend)
         self._stderr_limit = _StderrRateLimiter(stderr_rate_lines, stderr_rate_window_s)
-        self._on_exit = on_exit
+        self._include_raw = include_raw_events
 
         self.proc: asyncio.subprocess.Process | None = None
         self.pid: int | None = None
         self.turn_active: bool = False
         self._closing: bool = False
         self._stderr_tail: deque[str] = deque(maxlen=20)
-        self._oauth_emitted: bool = False
+        self._auth_emitted: bool = False
         self._reader_tasks: list[asyncio.Task] = []
         self._stdin_lock = asyncio.Lock()
 
@@ -101,7 +111,7 @@ class ClaudeSubprocess:
     async def spawn(self) -> None:
         """Launch the child. Raises :class:`SpawnFailedError` on OS error."""
         self._log.info(
-            "subprocess.spawn",
+            "backend.spawn",
             argv_head=self._argv[:4],
             cwd=self._cwd,
         )
@@ -118,22 +128,22 @@ class ClaudeSubprocess:
         self.pid = self.proc.pid
         self._log = self._log.bind(pid=self.pid)
         self._reader_tasks = [
-            asyncio.create_task(self._read_stdout(), name=f"cc-stdout-{self.session_id}"),
-            asyncio.create_task(self._read_stderr(), name=f"cc-stderr-{self.session_id}"),
-            asyncio.create_task(self._watch_exit(), name=f"cc-exit-{self.session_id}"),
+            asyncio.create_task(self._read_stdout(), name=f"claude-stdout-{self.session_id}"),
+            asyncio.create_task(self._read_stderr(), name=f"claude-stderr-{self.session_id}"),
+            asyncio.create_task(self._watch_exit(), name=f"claude-exit-{self.session_id}"),
         ]
 
     async def respawn_with_resume(self) -> None:
         """Replace ``--session-id X`` with ``--resume X`` and relaunch."""
-        self._argv = _argv_to_resume(self._argv, self.session_id)
+        self._argv = argv_to_resume(self._argv, self.session_id)
         await self.spawn()
 
     # ------------------------------------------------------------------
     # Turn I/O
     # ------------------------------------------------------------------
 
-    async def send_user_line(self, line: bytes) -> None:
-        """Write a single stream-json input line to stdin.
+    async def send_user_turn(self, message: dict[str, Any]) -> None:
+        """Write one stream-json line on the child's stdin.
 
         Raises :class:`SessionBusyError` if a turn is already in flight.
         """
@@ -141,6 +151,7 @@ class ClaudeSubprocess:
             raise SpawnFailedError("subprocess not running")
         if self.turn_active:
             raise SessionBusyError(self.session_id)
+        line = build_user_stdin_line(session_id=self.session_id, message=message)
         async with self._stdin_lock:
             self.turn_active = True
             assert self.proc.stdin is not None
@@ -172,7 +183,7 @@ class ClaudeSubprocess:
             try:
                 await asyncio.wait_for(self.proc.wait(), timeout=1.0)
             except TimeoutError:  # pragma: no cover - defensive
-                self._log.error("subprocess.kill_failed")
+                self._log.error("backend.kill_failed")
 
     async def interrupt(self) -> bool:
         """Terminate an in-flight turn and respawn via ``--resume``.
@@ -232,7 +243,7 @@ class ClaudeSubprocess:
                 raw = await stdout.readline()
             except (asyncio.LimitOverrunError, ValueError):
                 # Line longer than buffer; skip to next newline.
-                self._log.warning("subprocess.stdout_overrun")
+                self._log.warning("backend.stdout_overrun")
                 await stdout.read(1)
                 continue
             if not raw:
@@ -243,24 +254,24 @@ class ClaudeSubprocess:
             try:
                 event = json.loads(line.decode("utf-8", errors="replace"))
             except json.JSONDecodeError:
-                self._log.warning("subprocess.non_json_stdout", length=len(line))
+                self._log.warning("backend.non_json_stdout", length=len(line))
                 continue
             if not isinstance(event, dict):
                 continue
-            event["session_id"] = self.session_id
-            # Detect turn-end against the native CC type *before* namespacing
-            # it, so the check stays stable if we ever change the prefix.
-            orig_type = event.get("type")
-            if orig_type == "result":
-                self.turn_active = False
-            # Namespace CC native events under ``claude.*`` so clients can
-            # disambiguate them from ``blemeesd.*`` daemon frames without
-            # ambiguity. Daemon-originated frames (e.g. the subprocess's own
-            # ``blemeesd.stderr`` / ``blemeesd.error``) are emitted with their
-            # prefix already set and are left alone.
-            if isinstance(orig_type, str) and not orig_type.startswith(("blemeesd.", "claude.")):
-                event["type"] = f"claude.{orig_type}"
-            await self._enqueue(event)
+            for frame in translate_event(event, include_raw=self._include_raw):
+                # The translator returns frames without session_id / seq /
+                # backend; the daemon's per-session event handler fills
+                # session_id + seq, but we set `backend` here because it's
+                # backend-specific.
+                frame["backend"] = self.backend
+                # `agent.system_init` doesn't get `native_session_id` from
+                # CC's wire — it's the same as our session id (the value we
+                # passed via `--session-id`).
+                if frame.get("type") == "agent.system_init" and "native_session_id" not in frame:
+                    frame["native_session_id"] = self.session_id
+                if frame.get("type") in TURN_END_TYPES:
+                    self.turn_active = False
+                await self._on_event(frame)
 
     async def _read_stderr(self) -> None:
         assert self.proc is not None and self.proc.stderr is not None
@@ -278,21 +289,22 @@ class ClaudeSubprocess:
                 continue
             self._stderr_tail.append(line)
 
-            # OAuth-expired detection (§9.2); emitted at most once per spawn.
-            if not self._oauth_emitted and any(p in line for p in _OAUTH_PATTERNS):
-                self._oauth_emitted = True
-                await self._enqueue(
+            # Auth-failure detection (§9.2); emitted at most once per spawn.
+            if not self._auth_emitted and any(p in line for p in _AUTH_FAIL_PATTERNS):
+                self._auth_emitted = True
+                await self._on_event(
                     {
                         "type": "blemeesd.error",
                         "session_id": self.session_id,
-                        "code": OAUTH_EXPIRED,
+                        "backend": self.backend,
+                        "code": AUTH_FAILED,
                         "message": "Run `claude auth` to re-authenticate.",
                     }
                 )
                 continue
 
             if self._stderr_limit.allow():
-                await self._enqueue(
+                await self._on_event(
                     {
                         "type": "blemeesd.stderr",
                         "session_id": self.session_id,
@@ -303,34 +315,22 @@ class ClaudeSubprocess:
     async def _watch_exit(self) -> None:
         assert self.proc is not None
         rc = await self.proc.wait()
-        self._log.info("subprocess.exit", returncode=rc)
+        self._log.info("backend.exit", returncode=rc)
         if self._closing:
             return
         # Crash mid-turn (or unexpected exit): surface to the client.
         if self.turn_active or rc != 0:
             tail = " | ".join(self._stderr_tail) or f"exit {rc}"
-            await self._enqueue(
+            await self._on_event(
                 {
                     "type": "blemeesd.error",
                     "session_id": self.session_id,
-                    "code": CLAUDE_CRASHED,
+                    "backend": self.backend,
+                    "code": BACKEND_CRASHED,
                     "message": f"stderr tail: {tail}"[:2048],
                 }
             )
         self.turn_active = False
-        if self._on_exit is not None:
-            try:
-                await self._on_exit(self)
-            except Exception:  # pragma: no cover - defensive
-                self._log.exception("subprocess.on_exit_failed")
-
-    # ------------------------------------------------------------------
-
-    async def _enqueue(self, frame: dict[str, Any]) -> None:
-        # The Session is the authoritative event dispatcher: it tags with a
-        # monotonic seq, ring-buffers, (optionally) writes to the durable
-        # log, and pushes to whatever writer is currently attached.
-        await self._on_event(frame)
 
     @property
     def running(self) -> bool:
@@ -338,11 +338,201 @@ class ClaudeSubprocess:
 
 
 # ---------------------------------------------------------------------------
-# Argv helpers
+# Argv builders + safety filters
 # ---------------------------------------------------------------------------
 
 
-def _argv_to_resume(argv: list[str], session_id: str) -> list[str]:
+# Fields the daemon refuses to pass under `options.claude.*` (always
+# rejected with `unsafe_flag`).
+UNSAFE_OPTION_KEYS: frozenset[str] = frozenset(
+    {
+        "dangerously_skip_permissions",
+        "allow_dangerously_skip_permissions",
+        "bare",
+        "continue",
+        "continue_",
+        "from_pr",
+    }
+)
+
+# Daemon-owned CLI flags that clients must not set under any name
+# (including via `options.claude.<>` aliases).
+DAEMON_OWNED_OPTION_KEYS: frozenset[str] = frozenset({"input_format", "output_format"})
+
+# Free-form values that, if they match a refused CLI flag literal, are
+# rejected.
+UNSAFE_LITERAL_FLAGS: frozenset[str] = frozenset(
+    {
+        "--dangerously-skip-permissions",
+        "--allow-dangerously-skip-permissions",
+        "--bare",
+        "--continue",
+        "--from-pr",
+    }
+)
+
+
+# Whitelist of accepted `options.claude.*` keys. Each maps to one CC
+# CLI flag in `build_argv` (a few are flags-with-no-arg, the rest take
+# a value).
+VALID_OPTION_KEYS: frozenset[str] = frozenset(
+    {
+        "model",
+        "system_prompt",
+        "append_system_prompt",
+        "tools",
+        "disallowed_tools",
+        "permission_mode",
+        "cwd",
+        "add_dir",
+        "effort",
+        "agent",
+        "agents",
+        "mcp_config",
+        "strict_mcp_config",
+        "settings",
+        "setting_sources",
+        "plugin_dir",
+        "betas",
+        "exclude_dynamic_system_prompt_sections",
+        "max_budget_usd",
+        "json_schema",
+        "fallback_model",
+        "session_name",
+        "session_persistence",
+        "include_partial_messages",
+        "replay_user_messages",
+        # Translation-layer flag (not a CC CLI flag).
+        "include_raw_events",
+    }
+)
+
+
+def validate_options(options: dict[str, Any]) -> None:
+    """Raise on unsafe / daemon-owned / unknown keys under options.claude.
+
+    The wire schema rejects unknown keys via `additionalProperties:false`,
+    but the daemon does its own pass too — the schema validator is
+    optional in the dispatcher, and we want the same behaviour either
+    way.
+    """
+    for key in options:
+        if key in UNSAFE_OPTION_KEYS:
+            raise UnsafeFlagError(key)
+        if key in DAEMON_OWNED_OPTION_KEYS:
+            from ..errors import ProtocolError
+
+            raise ProtocolError(f"{key!r} is not client-settable; daemon always uses stream-json")
+        if key not in VALID_OPTION_KEYS:
+            from ..errors import ProtocolError
+
+            raise ProtocolError(f"unknown options.claude field: {key!r}")
+    for value in options.values():
+        if isinstance(value, str) and value in UNSAFE_LITERAL_FLAGS:
+            raise UnsafeFlagError(value)
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item in UNSAFE_LITERAL_FLAGS:
+                    raise UnsafeFlagError(item)
+
+
+def build_argv(
+    claude_bin: str,
+    *,
+    session_id: str,
+    options: dict[str, Any],
+    for_resume: bool,
+) -> list[str]:
+    """Build a `claude -p` argv list from validated options.claude.*.
+
+    The daemon always forces `--verbose --input-format stream-json
+    --output-format stream-json` (required by the event multiplexer).
+
+    Pass `for_resume=True` for both the resume-on-open path and the
+    post-interrupt respawn — emits `--resume <session>`. Otherwise
+    emits `--session-id <session>`.
+    """
+    argv: list[str] = [claude_bin, "-p", "--verbose"]
+
+    if for_resume:
+        argv += ["--resume", session_id]
+    else:
+        argv += ["--session-id", session_id]
+
+    argv += ["--input-format", "stream-json"]
+    argv += ["--output-format", "stream-json"]
+
+    f = options
+
+    def add(flag: str, value: Any) -> None:
+        argv.append(flag)
+        argv.append(str(value))
+
+    def add_list(flag: str, values: Iterable[Any]) -> None:
+        argv.append(flag)
+        argv.extend(str(v) for v in values)
+
+    if "model" in f and f["model"] is not None:
+        add("--model", f["model"])
+    if "system_prompt" in f and f["system_prompt"] is not None:
+        add("--system-prompt", f["system_prompt"])
+    if "append_system_prompt" in f and f["append_system_prompt"] is not None:
+        add("--append-system-prompt", f["append_system_prompt"])
+    if "tools" in f and f["tools"] is not None:
+        # Empty string is a legitimate value (disable all tools).
+        add("--tools", f["tools"])
+    if "disallowed_tools" in f and f["disallowed_tools"]:
+        add_list("--disallowedTools", f["disallowed_tools"])
+    if "permission_mode" in f and f["permission_mode"] is not None:
+        add("--permission-mode", f["permission_mode"])
+    if "add_dir" in f and f["add_dir"]:
+        add_list("--add-dir", f["add_dir"])
+    if "effort" in f and f["effort"] is not None:
+        add("--effort", f["effort"])
+    if "agent" in f and f["agent"] is not None:
+        add("--agent", f["agent"])
+    if "agents" in f and f["agents"] is not None:
+        if isinstance(f["agents"], str):
+            add("--agents", f["agents"])
+        else:
+            add("--agents", json.dumps(f["agents"], separators=(",", ":")))
+    if "mcp_config" in f and f["mcp_config"]:
+        add_list("--mcp-config", f["mcp_config"])
+    if f.get("strict_mcp_config"):
+        argv.append("--strict-mcp-config")
+    if "settings" in f and f["settings"] is not None:
+        add("--settings", f["settings"])
+    if "setting_sources" in f and f["setting_sources"] is not None:
+        add("--setting-sources", f["setting_sources"])
+    if "plugin_dir" in f and f["plugin_dir"]:
+        for item in f["plugin_dir"]:
+            add("--plugin-dir", item)
+    if "betas" in f and f["betas"]:
+        add_list("--betas", f["betas"])
+    if f.get("exclude_dynamic_system_prompt_sections"):
+        argv.append("--exclude-dynamic-system-prompt-sections")
+    if "max_budget_usd" in f and f["max_budget_usd"] is not None:
+        add("--max-budget-usd", f["max_budget_usd"])
+    if "json_schema" in f and f["json_schema"] is not None:
+        if isinstance(f["json_schema"], str):
+            add("--json-schema", f["json_schema"])
+        else:
+            add("--json-schema", json.dumps(f["json_schema"], separators=(",", ":")))
+    if "fallback_model" in f and f["fallback_model"] is not None:
+        add("--fallback-model", f["fallback_model"])
+    if "session_name" in f and f["session_name"] is not None:
+        add("-n", f["session_name"])
+    if "session_persistence" in f and f["session_persistence"] is False:
+        argv.append("--no-session-persistence")
+    if f.get("include_partial_messages"):
+        argv.append("--include-partial-messages")
+    if f.get("replay_user_messages"):
+        argv.append("--replay-user-messages")
+
+    return argv
+
+
+def argv_to_resume(argv: list[str], session_id: str) -> list[str]:
     """Rewrite ``--session-id X`` → ``--resume X`` for respawn.
 
     If ``--resume X`` is already present the argv is returned unchanged.
@@ -364,6 +554,17 @@ def _argv_to_resume(argv: list[str], session_id: str) -> list[str]:
         # Defensive: ensure resume flag is present.
         out += ["--resume", session_id]
     return out
+
+
+def build_user_stdin_line(session_id: str, *, message: dict[str, Any]) -> bytes:
+    """Wrap an `agent.user.message` into one stream-json line for CC stdin."""
+    payload = {"type": "user", "message": message, "session_id": session_id}
+    return (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# On-disk transcript helpers
+# ---------------------------------------------------------------------------
 
 
 def project_dir_for_cwd(cwd: str | None) -> Path:
@@ -388,12 +589,7 @@ _PREVIEW_SCAN_LINES = 8
 
 
 def _first_user_preview(path: Path) -> str | None:
-    """Best-effort extraction of the first user message from a CC transcript.
-
-    Scans the first few lines, returning the text of the first ``type:"user"``
-    record (content may be a string or a list of blocks). Returns ``None`` if
-    we can't find one — treat as "no preview available".
-    """
+    """Best-effort extraction of the first user message from a CC transcript."""
     try:
         with path.open("r", encoding="utf-8", errors="replace") as fh:
             for _ in range(_PREVIEW_SCAN_LINES):
@@ -424,7 +620,7 @@ def _first_user_preview(path: Path) -> str | None:
     return None
 
 
-def list_session_files(cwd: str | None) -> list[dict]:
+def list_on_disk_sessions(cwd: str | None) -> list[dict]:
     """Enumerate on-disk CC transcripts for ``cwd``.
 
     Returns newest-first summaries: ``{session_id, mtime_ms, size, preview?}``.
@@ -454,3 +650,51 @@ def list_session_files(cwd: str | None) -> list[dict]:
         out.append(record)
     out.sort(key=lambda r: r["mtime_ms"], reverse=True)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Version detection
+# ---------------------------------------------------------------------------
+
+
+_VERSION_RE = re.compile(r"\b(\d+(?:\.\d+){1,3}\S*)")
+
+
+def detect_version(claude_bin: str) -> str | None:
+    """Run ``claude --version`` once at startup. Best-effort; None on failure."""
+    import shutil
+    import subprocess
+
+    path = shutil.which(claude_bin) or claude_bin
+    try:
+        out = subprocess.run(
+            [path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    blob = (out.stdout or out.stderr or "").strip()
+    if not blob:
+        return None
+    m = _VERSION_RE.search(blob)
+    return m.group(1) if m else blob
+
+
+__all__ = [
+    "ClaudeBackend",
+    "argv_to_resume",
+    "build_argv",
+    "build_user_stdin_line",
+    "detect_version",
+    "list_on_disk_sessions",
+    "project_dir_for_cwd",
+    "session_file_path",
+    "validate_options",
+    "VALID_OPTION_KEYS",
+    "UNSAFE_OPTION_KEYS",
+    "DAEMON_OWNED_OPTION_KEYS",
+]

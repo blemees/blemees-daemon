@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "blemees"
 version = "0.7.0"
-description = "Headless agent daemon exposing `claude -p` over a Unix socket."
+description = "Headless agent daemon exposing local agent CLIs (Claude Code, Codex) over a Unix socket."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "blemees contributors" }]
-keywords = ["claude", "claude-code", "daemon", "unix-socket"]
+keywords = ["claude", "claude-code", "codex", "agent", "daemon", "unix-socket"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -49,6 +49,7 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
     "requires_claude: needs a real `claude` binary authenticated in the test environment",
+    "requires_codex: needs a real `codex` binary, authenticated via `codex login`",
 ]
 
 [tool.ruff]
@@ -70,6 +71,12 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["B011"]     # assert False is OK in tests
 "blemees/subprocess.py" = ["A005"]  # stdlib shadowing intentional
+
+[tool.ruff.lint.isort]
+# Keep aliased imports grouped under a single from-clause rather than
+# splitting one-per-line — matters most for daemon.py / backends where
+# a backend module exports half a dozen aliased helpers.
+combine-as-imports = true
 
 [tool.ruff.format]
 quote-style = "double"

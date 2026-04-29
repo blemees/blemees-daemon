@@ -2,18 +2,19 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://blemees/schemas/outbound/blemeesd.hello_ack.json",
   "title": "blemeesd.hello_ack",
-  "description": "Reply to a successful blemeesd.hello handshake.",
+  "description": "Reply to a successful blemeesd.hello handshake. `backends` carries one entry per backend the daemon successfully detected at startup; backends whose binary is missing are omitted.",
   "type": "object",
   "properties": {
     "type": { "const": "blemeesd.hello_ack" },
     "daemon": { "type": "string", "description": "e.g. `blemeesd/0.1.0`" },
-    "protocol": { "const": "blemees/1" },
+    "protocol": { "const": "blemees/2" },
     "pid": { "type": "integer" },
-    "claude_version": {
-      "type": ["string", "null"],
-      "description": "Result of `claude --version` captured at daemon startup."
+    "backends": {
+      "type": "object",
+      "description": "Map of backend name → version string detected at startup. Missing keys mean the binary was not on PATH or its --version probe failed.",
+      "additionalProperties": { "type": "string" }
     }
   },
-  "required": ["type", "daemon", "protocol", "pid"],
+  "required": ["type", "daemon", "protocol", "pid", "backends"],
   "additionalProperties": true
 }

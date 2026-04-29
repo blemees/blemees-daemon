@@ -10,13 +10,14 @@ from __future__ import annotations
 PROTOCOL_MISMATCH = "protocol_mismatch"
 INVALID_MESSAGE = "invalid_message"
 UNKNOWN_MESSAGE = "unknown_message"
+UNKNOWN_BACKEND = "unknown_backend"
 UNSAFE_FLAG = "unsafe_flag"
 SESSION_UNKNOWN = "session_unknown"
 SESSION_EXISTS = "session_exists"
 SESSION_BUSY = "session_busy"
 SPAWN_FAILED = "spawn_failed"
-CLAUDE_CRASHED = "claude_crashed"
-OAUTH_EXPIRED = "oauth_expired"
+BACKEND_CRASHED = "backend_crashed"
+AUTH_FAILED = "auth_failed"
 OVERSIZE_MESSAGE = "oversize_message"
 SLOW_CONSUMER = "slow_consumer"
 DAEMON_SHUTDOWN = "daemon_shutdown"
@@ -47,10 +48,6 @@ class BlemeesError(Exception):
         return self.code in FATAL_CODES
 
 
-# Backward-compatible alias kept for any external code that imported the old name.
-CcsockError = BlemeesError
-
-
 class ProtocolError(BlemeesError):
     def __init__(self, message: str, code: str = INVALID_MESSAGE) -> None:
         super().__init__(code, message)
@@ -60,6 +57,12 @@ class UnsafeFlagError(BlemeesError):
     def __init__(self, flag: str) -> None:
         super().__init__(UNSAFE_FLAG, f"refused flag: {flag}")
         self.flag = flag
+
+
+class UnknownBackendError(BlemeesError):
+    def __init__(self, backend: str) -> None:
+        super().__init__(UNKNOWN_BACKEND, f"unknown backend: {backend!r}")
+        self.backend = backend
 
 
 class SessionUnknownError(BlemeesError):

@@ -10,7 +10,7 @@ from blemees.session import Session, SessionTable
 
 
 def _open_msg(session: str = "s1") -> OpenMessage:
-    return OpenMessage(id=None, session_id=session, resume=False, fields={"session_id": session})
+    return OpenMessage(id=None, session_id=session, backend="claude", options={}, resume=False)
 
 
 async def test_register_and_get():

@@ -3,10 +3,14 @@
 Usage::
 
     async with BlemeesClient.connect() as c:
-        async with c.open_session(session_id="s1", model="sonnet", tools="") as s:
+        async with c.open_session(
+            session_id="s1",
+            backend="claude",
+            options={"model": "sonnet", "tools": ""},
+        ) as s:
             await s.send_user("hi")
             async for evt in s.events():
-                if evt.get("type") == "claude.result":
+                if evt.get("type") == "agent.result":
                     break
 """
 
@@ -64,7 +68,7 @@ class Session:
             payload: object = content if content is not None else (text or "")
             message = {"role": "user", "content": payload}
         await self._client._send(
-            {"type": "claude.user", "session_id": self.session_id, "message": message}
+            {"type": "agent.user", "session_id": self.session_id, "message": message}
         )
 
     async def interrupt(self) -> None:
@@ -149,16 +153,33 @@ class BlemeesClient:
         return list(reply.get("sessions", []))
 
     @contextlib.asynccontextmanager
-    async def open_session(self, *, session_id: str, **fields: Any) -> AsyncIterator[Session]:
+    async def open_session(
+        self,
+        *,
+        session_id: str,
+        backend: str = "claude",
+        options: dict[str, Any] | None = None,
+        resume: bool = False,
+        last_seen_seq: int | None = None,
+    ) -> AsyncIterator[Session]:
         self._next_req += 1
         req_id = f"req_{self._next_req}"
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[req_id] = fut
         sess = Session(self, session_id)
         self._sessions[session_id] = sess
-        await self._send(
-            {"type": "blemeesd.open", "id": req_id, "session_id": session_id, **fields}
-        )
+        frame: dict[str, Any] = {
+            "type": "blemeesd.open",
+            "id": req_id,
+            "session_id": session_id,
+            "backend": backend,
+            "options": {backend: dict(options or {})},
+        }
+        if resume:
+            frame["resume"] = True
+        if last_seen_seq is not None:
+            frame["last_seen_seq"] = last_seen_seq
+        await self._send(frame)
         reply = await fut
         if reply.get("type") == "blemeesd.error":
             self._sessions.pop(session_id, None)

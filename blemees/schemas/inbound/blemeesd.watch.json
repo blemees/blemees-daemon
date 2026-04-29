@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://blemees/schemas/inbound/blemeesd.watch.json",
   "title": "blemeesd.watch",
-  "description": "Subscribe to a session's event stream without owning it. The session must exist (error code: session_unknown). Watchers receive every frame the driving client gets (claude.* events, blemeesd.stderr/replay_gap/error) but cannot send claude.user / blemeesd.interrupt / blemeesd.close for that session.",
+  "description": "Subscribe to a session's event stream without owning it. The session must exist (error code: session_unknown). Watchers receive every frame the driving client gets (agent.* events, blemeesd.stderr/replay_gap/error) but cannot send agent.user / blemeesd.interrupt / blemeesd.close for that session.",
   "type": "object",
   "properties": {
     "type": { "const": "blemeesd.watch" },
