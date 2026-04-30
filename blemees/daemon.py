@@ -458,6 +458,13 @@ class Connection:
         )
 
     async def _handle_user(self, msg) -> None:
+        # Per spec §5.14, ``agent.user`` is connection-scoped — only the
+        # owning connection (the one that opened or took over the session)
+        # can drive turns. A non-owner sees the session as unknown.
+        if msg.session_id not in self._owned_sessions:
+            from .errors import SessionUnknownError
+
+            raise SessionUnknownError(msg.session_id)
         sess = self._sessions.get(msg.session_id)
         if sess.backend is None or not sess.backend.running:
             # Respawn transparently (spec §9.1).
@@ -480,8 +487,26 @@ class Connection:
             await self._emit_error(SESSION_BUSY, exc.message, session_id=msg.session_id)
         except SpawnFailedError as exc:
             await self._emit_error(SPAWN_FAILED, exc.message, session_id=msg.session_id)
+        except ProtocolError as exc:
+            # e.g. Codex rejecting a non-text content block. Surface as
+            # ``invalid_message`` with the session id so clients can
+            # correlate the failure to their open session.
+            await self._emit_error(INVALID_MESSAGE, exc.message, session_id=msg.session_id)
 
     async def _handle_interrupt(self, msg) -> None:
+        # Per spec §5.14, ``blemeesd.interrupt`` is connection-scoped to
+        # the owner. A non-owner gets the same ``was_idle:true`` reply
+        # the daemon would emit for an unknown session — they don't see
+        # whether the session actually exists somewhere else.
+        if msg.session_id not in self._owned_sessions:
+            await self._emit_frame(
+                {
+                    "type": "blemeesd.interrupted",
+                    "session_id": msg.session_id,
+                    "was_idle": True,
+                }
+            )
+            return
         sess = self._sessions.try_get(msg.session_id)
         if sess is None or sess.backend is None:
             await self._emit_frame(
@@ -547,6 +572,15 @@ class Connection:
         )
 
     async def _handle_close(self, msg) -> None:
+        # Per spec §5.14, ``blemeesd.close`` is connection-scoped to the
+        # owner. A non-owner gets the idempotent ``closed`` ack without
+        # the underlying session being touched — they don't see whether
+        # it exists elsewhere, and they can't kill someone else's session.
+        if msg.session_id not in self._owned_sessions:
+            await self._emit_frame(
+                {"type": "blemeesd.closed", "id": msg.id, "session_id": msg.session_id}
+            )
+            return
         self._log.info("session.close", session_id=msg.session_id, delete=msg.delete)
         self._owned_sessions.discard(msg.session_id)
         await self._sessions.remove(msg.session_id, delete_file=msg.delete)

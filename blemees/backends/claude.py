@@ -190,6 +190,15 @@ class ClaudeBackend:
 
         Returns ``False`` if there was no in-flight turn (caller should emit
         ``blemeesd.interrupted`` with ``was_idle: true`` and skip the respawn).
+
+        Also synthesises a closing ``agent.result{subtype:"interrupted"}`` so
+        clients see a consistent turn lifecycle (spec §5.7). The codex
+        backend gets this for free from its ``turn_aborted`` translator;
+        for claude we have to emit it ourselves since the kill prevents
+        the subprocess from producing a native ``result`` event. The
+        emit is scheduled as a task so the caller can emit
+        ``blemeesd.interrupted`` first — matching codex, where the
+        async ``turn_aborted`` event arrives after the ack.
         """
         if not self.turn_active:
             return False
@@ -201,6 +210,17 @@ class ClaudeBackend:
         self.turn_active = False
         self._closing = False
         await self.respawn_with_resume()
+        asyncio.create_task(
+            self._on_event(
+                {
+                    "type": "agent.result",
+                    "subtype": "interrupted",
+                    "num_turns": 1,
+                    "backend": self.backend,
+                }
+            ),
+            name=f"claude-synth-interrupted-{self.session_id}",
+        )
         return True
 
     async def close(self) -> None:
@@ -570,12 +590,17 @@ def build_user_stdin_line(session_id: str, *, message: dict[str, Any]) -> bytes:
 def project_dir_for_cwd(cwd: str | None) -> Path:
     """Return the ``~/.claude/projects/<encoded-cwd>/`` directory CC uses.
 
-    Mirrors Claude Code's "slashes → dashes, leading dash" encoding. We
-    don't rely on this for correctness within a session; it's only used
-    for on-disk operations (delete-on-close, list-sessions).
+    Mirrors Claude Code's path-encoding scheme: both ``/`` and ``_`` are
+    replaced with ``-``, and the result is prefixed with a single
+    leading ``-``. So ``/Users/me/test_dir`` lands at
+    ``~/.claude/projects/-Users-me-test-dir/``. Used only for on-disk
+    operations (delete-on-close, list-sessions); we don't round-trip
+    decode (the encoding is lossy when paths legitimately contain
+    dashes).
     """
     home = Path.home()
-    cwd_key = (cwd or str(home)).replace("/", "-").lstrip("-")
+    raw = cwd or str(home)
+    cwd_key = raw.replace("/", "-").replace("_", "-").lstrip("-")
     return home / ".claude" / "projects" / f"-{cwd_key}"
 
 
@@ -653,11 +678,12 @@ def list_on_disk_sessions(cwd: str | None) -> list[dict]:
 
 
 def _scan_transcript_metadata(path: Path) -> dict[str, Any]:
-    """Read the first few lines of a CC transcript for ``cwd`` / ``model``.
+    """Read the first lines of a CC transcript for ``cwd`` / ``model``.
 
-    Both fields appear inline on most event records; we scan up to a
-    handful of lines to find a non-null value. Returns ``{}`` on read
-    failure.
+    Real CC transcripts carry ``cwd`` at the top level on most records
+    but nest ``model`` under ``event.message.model`` (assistant events).
+    We scan up to a handful of lines and check both shapes; returns
+    ``{}`` on read failure.
     """
     out: dict[str, Any] = {}
     try:
@@ -674,8 +700,14 @@ def _scan_transcript_metadata(path: Path) -> dict[str, Any]:
                     continue
                 if "cwd" not in out and isinstance(evt.get("cwd"), str) and evt["cwd"]:
                     out["cwd"] = evt["cwd"]
-                if "model" not in out and isinstance(evt.get("model"), str) and evt["model"]:
-                    out["model"] = evt["model"]
+                if "model" not in out:
+                    top = evt.get("model")
+                    msg = evt.get("message") if isinstance(evt.get("message"), dict) else None
+                    nested = msg.get("model") if msg is not None else None
+                    for candidate in (top, nested):
+                        if isinstance(candidate, str) and candidate:
+                            out["model"] = candidate
+                            break
                 if "cwd" in out and "model" in out:
                     break
     except OSError:

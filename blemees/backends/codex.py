@@ -876,18 +876,22 @@ def _read_rollout_head(path: Path) -> list[dict[str, Any]]:
 
 
 def _extract_session_configured(events: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Find the embedded session_configured event in a rollout head.
+    """Find the session-metadata dict inside a rollout head.
 
-    Codex stores rollout events with the same ``msg.{type,…}`` shape as
-    the wire protocol, possibly nested inside a ``payload`` /
-    ``params`` envelope. We accept either the flat-``msg`` form or a
-    record whose ``type`` directly equals ``session_configured``.
+    Codex 0.125.x writes a top-level ``type: session_meta`` envelope
+    with the bulk of the metadata (``cwd``, ``id``, ``base_instructions``,
+    …) under ``payload``. Older codex builds emit ``session_configured``
+    directly (or nested under ``msg`` / ``payload``). We accept any of
+    these shapes and return the inner dict that has the metadata.
     """
     for evt in events:
         if not isinstance(evt, dict):
             continue
-        if evt.get("type") == "session_configured":
+        evt_type = evt.get("type")
+        if evt_type == "session_configured":
             return evt
+        if evt_type == "session_meta" and isinstance(evt.get("payload"), dict):
+            return evt["payload"]
         msg = evt.get("msg")
         if isinstance(msg, dict) and msg.get("type") == "session_configured":
             return msg
@@ -897,35 +901,79 @@ def _extract_session_configured(events: list[dict[str, Any]]) -> dict[str, Any] 
     return None
 
 
+_SYNTHETIC_USER_PREFIXES: tuple[str, ...] = (
+    "<environment_context>",
+    "<permissions instructions>",
+    "<permissions>",
+    "<user_instructions>",
+)
+
+
 def _first_user_preview_from_rollout(events: list[dict[str, Any]]) -> str | None:
-    """Best-effort first-user-message preview (matching the Claude
-    backend's behaviour). Looks for an ``UserMessage`` ``item_completed``
-    or a flat ``user_message``.
+    """Best-effort first-user-message preview.
+
+    Codex 0.125.x rollouts wrap user prompts as
+    ``response_item / payload(type=message,role=user,content=[input_text…])``.
+    Older builds emit ``item_completed{UserMessage}`` or a flat
+    ``user_message{message}``. We recognise all three and skip the
+    synthetic system-injected XML envelopes (``environment_context``,
+    ``permissions instructions``) so the preview reflects what the
+    *human* actually typed.
     """
     for evt in events:
         if not isinstance(evt, dict):
             continue
-        # Flat shape (matches the wire form).
+        # response_item / payload.type=message / role=user (codex 0.125.x)
+        payload = evt.get("payload")
+        if (
+            evt.get("type") == "response_item"
+            and isinstance(payload, dict)
+            and payload.get("type") == "message"
+            and payload.get("role") == "user"
+        ):
+            text = _content_text_blocks(payload.get("content"))
+            if text is not None and not _looks_synthetic(text):
+                return text[:_PREVIEW_CAP]
+        # event_msg / payload.type=user_message
+        if (
+            evt.get("type") == "event_msg"
+            and isinstance(payload, dict)
+            and payload.get("type") == "user_message"
+        ):
+            txt = payload.get("message")
+            if isinstance(txt, str) and txt and not _looks_synthetic(txt):
+                return txt[:_PREVIEW_CAP]
+        # Older flat shapes — ``msg.type`` directly on the record or
+        # nested under ``msg``.
         msg = evt.get("msg") if isinstance(evt.get("msg"), dict) else evt
         if not isinstance(msg, dict):
             continue
-        # `item_completed{UserMessage}`.
         if msg.get("type") == "item_completed":
             item = msg.get("item")
             if isinstance(item, dict) and item.get("type") == "UserMessage":
                 content = item.get("content")
                 text = _content_text_blocks(content)
-                if text is not None:
+                if text is not None and not _looks_synthetic(text):
                     return text[:_PREVIEW_CAP]
-        # `user_message{message}`.
         if msg.get("type") == "user_message":
             txt = msg.get("message")
-            if isinstance(txt, str) and txt:
+            if isinstance(txt, str) and txt and not _looks_synthetic(txt):
                 return txt[:_PREVIEW_CAP]
     return None
 
 
+def _looks_synthetic(text: str) -> bool:
+    """True for codex's templated context messages (env, permissions, …)."""
+    stripped = text.lstrip()
+    return any(stripped.startswith(p) for p in _SYNTHETIC_USER_PREFIXES)
+
+
 def _content_text_blocks(content: Any) -> str | None:
+    """Concatenate ``text`` from any text-bearing content blocks.
+
+    Codex emits both ``text`` (assistant/user output) and ``input_text``
+    (user input) blocks; both carry the literal under ``text``.
+    """
     if not isinstance(content, list):
         return None
     parts: list[str] = []
@@ -933,7 +981,9 @@ def _content_text_blocks(content: Any) -> str | None:
         if not isinstance(block, dict):
             continue
         block_type = block.get("type")
-        if isinstance(block_type, str) and block_type.lower() == "text":
+        if not isinstance(block_type, str):
+            continue
+        if block_type.lower() in {"text", "input_text"}:
             text = block.get("text", "")
             if isinstance(text, str):
                 parts.append(text)

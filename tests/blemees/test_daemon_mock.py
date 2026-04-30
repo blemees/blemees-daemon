@@ -239,6 +239,56 @@ async def test_interrupt_respawns_with_resume(
     assert resumed_argv[resumed_argv.index("--resume") + 1] == "s-int"
 
 
+async def test_interrupt_emits_synthesized_agent_result(client_factory, fake_mode):
+    """The claude backend synthesises ``agent.result{subtype:"interrupted"}``
+    after a kill mid-turn (spec §5.7). The order on the wire must be
+    ``blemeesd.interrupted`` first, then the synthesised
+    ``agent.result`` — matching how codex emits the equivalent via its
+    ``turn_aborted`` event.
+    """
+    fake_mode("slow")
+    client = await client_factory()
+    await client.send(
+        {
+            "type": "blemeesd.open",
+            "id": "r1",
+            "session_id": "s-synth",
+            "backend": "claude",
+            "options": {"claude": {"tools": ""}},
+        }
+    )
+    await client.wait_for(lambda e: e.get("type") == "blemeesd.opened")
+    await client.send(
+        {
+            "type": "agent.user",
+            "session_id": "s-synth",
+            "message": {"role": "user", "content": "go"},
+        }
+    )
+    await client.wait_for(lambda e: e.get("type") == "agent.delta")
+    await client.send({"type": "blemeesd.interrupt", "session_id": "s-synth"})
+
+    # Drain frames until both the ack and the synthesised result land.
+    seen: dict[str, dict] = {}
+    deadline = asyncio.get_running_loop().time() + 5.0
+    while not ({"blemeesd.interrupted", "agent.result"} <= seen.keys()):
+        remaining = deadline - asyncio.get_running_loop().time()
+        assert remaining > 0, f"missing frames; got={list(seen)}"
+        evt = await client.recv(timeout=remaining)
+        t = evt.get("type")
+        if t == "blemeesd.interrupted":
+            seen.setdefault("blemeesd.interrupted", evt)
+        elif t == "agent.result" and evt.get("session_id") == "s-synth":
+            seen.setdefault("agent.result", evt)
+    assert seen["blemeesd.interrupted"]["was_idle"] is False
+    assert seen["agent.result"]["subtype"] == "interrupted"
+    assert seen["agent.result"]["backend"] == "claude"
+    # Order check: the synthesised agent.result must arrive *after* the
+    # blemeesd.interrupted ack so clients can rely on it as a clean
+    # turn-end marker (matching codex's order).
+    assert seen["agent.result"]["seq"] > seen["blemeesd.interrupted"].get("seq", 0)
+
+
 async def test_concurrent_sessions_dont_interfere(client_factory, fake_mode):
     fake_mode("normal")
     client = await client_factory()

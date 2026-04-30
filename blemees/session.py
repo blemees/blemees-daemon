@@ -359,6 +359,7 @@ class Session:
         return {
             "session_id": self.session_id,
             "backend": self.backend_name,
+            "native_session_id": self.native_session_id or self.session_id,
             "model": self.last_model,
             "cwd": self.cwd,
             "turns": self.turns,
