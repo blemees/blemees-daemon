@@ -174,9 +174,17 @@ class CodexTranslator:
             self._pending_context_window = ctx
 
         data: dict[str, Any] = {}
-        for key in ("turn_id", "model_context_window", "started_at"):
+        for key in ("turn_id", "model_context_window"):
             if key in msg and msg[key] is not None:
                 data[key] = msg[key]
+        # Codex sends `started_at` as Unix **seconds** (e.g.
+        # `1777315342`). Normalise to `started_at_ms` (Unix
+        # milliseconds) so the field aligns with the daemon's
+        # ms-everywhere convention and with claude's synth
+        # `task_started.data.started_at_ms`.
+        started_at = msg.get("started_at")
+        if isinstance(started_at, (int, float)):
+            data["started_at_ms"] = int(started_at * 1000)
 
         notice: dict[str, Any] = {
             "type": "agent.notice",

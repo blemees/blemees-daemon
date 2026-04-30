@@ -83,8 +83,12 @@ following invariants regardless of backend:
 - **Every turn opens with `agent.notice{category:"task_started"}`.**
   Codex emits this natively from `task_started`; the Claude backend
   synthesises one when it writes the user turn to stdin. Carries
-  `data: {turn_id, started_at_ms}`. Clients can use it for
-  "model is thinking…" UI hooks on both backends.
+  `data: {turn_id, started_at_ms}` on both backends. (Codex's wire
+  field `started_at` is Unix seconds; the translator normalises to
+  `started_at_ms` in milliseconds so the field name *and* unit
+  match claude's synth notice — see the codex translation table
+  below.) Clients can use it for "model is thinking…" UI hooks on
+  both backends.
 
 - **`agent.result.turn_id` is always set.** Codex carries it from
   `task_complete`; for Claude the daemon allocates a per-turn UUID hex
@@ -161,7 +165,7 @@ originating `tools/call`, plus the preceding `task_complete` and last
 | `session_configured` | `agent.system_init{model, cwd, native_session_id: msg.session_id, capabilities: {sandbox_policy, approval_policy, permission_profile, reasoning_effort, rollout_path}}` | One per spawn. `model_provider_id`, `history_*` go under `raw`. |
 | `mcp_startup_update` | `agent.notice{level:"info", category:"backend_mcp_startup", data:{server, status}}` | Codex's own external MCP children. |
 | `mcp_startup_complete` | `agent.notice{level:"info", category:"backend_mcp_startup_complete", data:{ready, failed, cancelled}}` | |
-| `task_started` | `agent.notice{level:"info", category:"task_started", data:{turn_id, model_context_window, started_at}}` *or* fold `model_context_window` into `agent.system_init` if not yet emitted | We chose: fold context window into init when known; emit notice with `turn_id`. |
+| `task_started` | `agent.notice{level:"info", category:"task_started", data:{turn_id, model_context_window, started_at_ms}}` *or* fold `model_context_window` into `agent.system_init` if not yet emitted | We chose: fold context window into init when known; emit notice with `turn_id`. Codex sends `started_at` in Unix **seconds**; the translator multiplies by 1000 and renames to `started_at_ms` so the unit + field name match claude's synth notice and the daemon's ms-everywhere convention (`last_turn_at_ms`, etc). |
 | `raw_response_item` | dropped from primary stream; surfaced under `raw` when opt-in | Duplicates the structured `item_*` events. |
 | `item_started{item:{type:"UserMessage", content}}` | dropped (we wait for completed) | |
 | `item_completed{item:{type:"UserMessage", content}}` | `agent.user_echo{message:{role:"user", content: <translated>}}` | Only when `options.codex.user_echo:true`. Off by default — translator drops the frame. |

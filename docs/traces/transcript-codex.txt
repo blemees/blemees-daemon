@@ -73,7 +73,7 @@
   "category": "task_started",
   "data": {
     "model_context_window": 258400,
-    "started_at": "<ts>",
+    "started_at_ms": "<ts>",
     "turn_id": "<turn_id_1>"
   },
   "level": "info",

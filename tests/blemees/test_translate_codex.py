@@ -68,6 +68,9 @@ def test_session_configured_carries_raw_when_opted_in():
 
 
 def test_task_started_emits_notice_when_init_already_emitted():
+    """Codex's `started_at` (Unix seconds) is normalised to
+    `started_at_ms` (Unix milliseconds) so the field name + unit
+    match claude's daemon-synth `task_started.data.started_at_ms`."""
     t = CodexTranslator()
     t.translate_event(
         {"type": "session_configured", "session_id": THREAD_ID, "model": "m"}, meta=META
@@ -87,7 +90,7 @@ def test_task_started_emits_notice_when_init_already_emitted():
     assert notice["category"] == "task_started"
     assert notice["data"] == {
         "turn_id": "3",
-        "started_at": 1777315342,
+        "started_at_ms": 1777315342_000,
         "model_context_window": 258400,
     }
 

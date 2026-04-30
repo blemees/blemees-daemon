@@ -78,7 +78,7 @@
       "status": "allowed"
     },
     "session_id": "<session_id>",
-    "uuid": "d2645cd7-a693-4bf5-a861-4444d5548086"
+    "uuid": "837e6952-9657-4c3a-b2df-6bb2e80ab117"
   },
   "level": "info",
   "session_id": "<session_id>",
