@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "blemees"
-version = "0.8.7"
+version = "0.9.0"
 description = "Headless agent daemon exposing local agent CLIs (Claude Code, Codex) over a Unix socket."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -26,7 +26,13 @@ dependencies = []
 
 [project.scripts]
 blemeesd = "blemees.__main__:main"
-blemees = "blemees.cli:main"
+blemeesctl = "blemees.cli:main"
+# `blemees` is intentionally NOT registered here. From 0.9.0 onward
+# that name belongs to the chat TUI shipped by the `blemees-tui`
+# package. Users who installed daemon 0.8.x and earlier had `blemees`
+# as the wire-protocol REPL; that role is now `blemeesctl`. Side-by-side
+# install of `blemees` (daemon) and `blemees-tui` would otherwise have
+# both packages fighting over the `blemees` console_script.
 
 [project.optional-dependencies]
 dev = [

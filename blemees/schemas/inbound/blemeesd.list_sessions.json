@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://blemees/schemas/inbound/blemeesd.list_sessions.json",
   "title": "blemeesd.list_sessions",
-  "description": "Enumerate past and currently-attached sessions for a given project cwd. Parity with Claude Code's interactive /resume.",
+  "description": "Enumerate sessions known to the daemon. `cwd` and `live` are independent, fully-composable filters; omitting a filter means \"no filter on that axis\". `cwd` set restricts to that working directory; absent walks every project under `~/.claude/projects/` and every cwd under `~/.codex/sessions/`. `live:true` includes only sessions live in the daemon's SessionTable. `live:false` includes only cold (on-disk) sessions, subtracting any session that's currently live. `live` absent merges both. Empty body means \"every session, everywhere\" — including a full disk walk; clients that just want \"what's running now\" should pass `live:true`.",
   "type": "object",
   "properties": {
     "type": { "const": "blemeesd.list_sessions" },
@@ -10,9 +10,13 @@
     "cwd": {
       "type": "string",
       "minLength": 1,
-      "description": "Absolute project directory. Scopes the listing to ~/.claude/projects/<cwd-hash>/."
+      "description": "Absolute project directory. Scopes both the disk scan and the live overlay; absent means every cwd."
+    },
+    "live": {
+      "type": "boolean",
+      "description": "Tri-state filter. `true` = live sessions only (no disk scan). `false` = cold sessions only (excludes anything currently live). Absent = both, merged."
     }
   },
-  "required": ["type", "cwd"],
+  "required": ["type"],
   "additionalProperties": false
 }

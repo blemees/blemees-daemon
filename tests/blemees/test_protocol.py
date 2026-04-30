@@ -432,9 +432,52 @@ def test_parse_close_delete_true():
 # ---------------------------------------------------------------------------
 
 
-def test_parse_list_sessions_requires_cwd():
-    with pytest.raises(ProtocolError):
-        parse_list_sessions({"type": "blemeesd.list_sessions"})
+def test_parse_list_sessions_empty_body_means_no_filters():
+    """Both axes unfiltered: the daemon walks every project + every
+    live session, returning the union."""
+    msg = parse_list_sessions({"type": "blemeesd.list_sessions"})
+    assert msg.cwd is None
+    assert msg.live is None  # tri-state: None = unfiltered
+
+
+def test_parse_list_sessions_with_cwd_only():
+    """The original v0.1 contract: filter by cwd, both live and disk."""
+    msg = parse_list_sessions(
+        {"type": "blemeesd.list_sessions", "id": "r1", "cwd": "/home/u/proj"}
+    )
+    assert msg.cwd == "/home/u/proj"
+    assert msg.id == "r1"
+    assert msg.live is None
+
+
+def test_parse_list_sessions_live_true_only():
+    msg = parse_list_sessions({"type": "blemeesd.list_sessions", "live": True})
+    assert msg.cwd is None
+    assert msg.live is True
+
+
+def test_parse_list_sessions_live_false_only():
+    """Cold-only listing across every cwd. Allowed; the user accepts
+    the cost of the full disk scan."""
+    msg = parse_list_sessions({"type": "blemeesd.list_sessions", "live": False})
+    assert msg.cwd is None
+    assert msg.live is False
+
+
+def test_parse_list_sessions_cwd_plus_live_true():
+    msg = parse_list_sessions(
+        {"type": "blemeesd.list_sessions", "cwd": "/proj", "live": True}
+    )
+    assert msg.cwd == "/proj"
+    assert msg.live is True
+
+
+def test_parse_list_sessions_cwd_plus_live_false():
+    msg = parse_list_sessions(
+        {"type": "blemeesd.list_sessions", "cwd": "/proj", "live": False}
+    )
+    assert msg.cwd == "/proj"
+    assert msg.live is False
 
 
 def test_parse_list_sessions_rejects_non_string_cwd():
@@ -442,10 +485,14 @@ def test_parse_list_sessions_rejects_non_string_cwd():
         parse_list_sessions({"type": "blemeesd.list_sessions", "cwd": 42})
 
 
-def test_parse_list_sessions_ok():
-    msg = parse_list_sessions({"type": "blemeesd.list_sessions", "id": "r1", "cwd": "/home/u/proj"})
-    assert msg.cwd == "/home/u/proj"
-    assert msg.id == "r1"
+def test_parse_list_sessions_rejects_empty_cwd():
+    with pytest.raises(ProtocolError):
+        parse_list_sessions({"type": "blemeesd.list_sessions", "cwd": ""})
+
+
+def test_parse_list_sessions_rejects_non_bool_live():
+    with pytest.raises(ProtocolError):
+        parse_list_sessions({"type": "blemeesd.list_sessions", "live": "yes"})
 
 
 # ---------------------------------------------------------------------------

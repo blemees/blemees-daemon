@@ -151,7 +151,10 @@ class CloseMessage:
 @dataclasses.dataclass(slots=True)
 class ListSessionsMessage:
     id: str | None
-    cwd: str
+    cwd: str | None
+    # Tri-state: ``True`` includes only live sessions, ``False`` includes
+    # only non-live (cold disk) sessions, ``None`` (default) includes both.
+    live: bool | None
 
 
 @dataclasses.dataclass(slots=True)
@@ -292,14 +295,38 @@ def parse_close(obj: dict[str, Any]) -> CloseMessage:
 
 
 def parse_list_sessions(obj: dict[str, Any]) -> ListSessionsMessage:
-    _reject_extra_keys(obj, frozenset({"type", "id", "cwd"}))
-    cwd = obj.get("cwd")
-    if not isinstance(cwd, str) or not cwd:
-        raise ProtocolError("list_sessions requires non-empty 'cwd'")
+    """Parse ``blemeesd.list_sessions``.
+
+    ``cwd`` and ``live`` are independent, fully-composable filters.
+    Omitting a filter means "no filter on that axis":
+
+    * ``cwd`` set — restrict to that working directory; absent — every cwd.
+    * ``live: true`` — only sessions currently live in the daemon.
+    * ``live: false`` — only sessions that exist on disk but are not
+      currently live (cold sessions).
+    * ``live`` absent — both live and cold; the on-disk and live-overlay
+      passes are merged by ``(backend, session_id)``.
+
+    Empty body therefore means "every session, everywhere" — including
+    a full scan of ``~/.claude/projects/`` and ``~/.codex/sessions/``.
+    Callers who want the cheap watch-picker query should pass
+    ``live:true``.
+    """
+    _reject_extra_keys(obj, frozenset({"type", "id", "cwd", "live"}))
+
+    cwd_field = obj.get("cwd")
+    if cwd_field is not None and (not isinstance(cwd_field, str) or not cwd_field):
+        raise ProtocolError("'cwd' must be a non-empty string when set")
+
+    live_field = obj.get("live")
+    if live_field is not None and not isinstance(live_field, bool):
+        raise ProtocolError("'live' must be a boolean")
+
     req_id = obj.get("id")
     if req_id is not None and not isinstance(req_id, str):
         raise ProtocolError("'id' must be a string")
-    return ListSessionsMessage(id=req_id, cwd=cwd)
+
+    return ListSessionsMessage(id=req_id, cwd=cwd_field, live=live_field)
 
 
 def parse_ping(obj: dict[str, Any]) -> PingMessage:

@@ -832,12 +832,48 @@ def _first_user_preview(path: Path) -> str | None:
 
 
 def list_on_disk_sessions(cwd: str | None) -> list[dict]:
-    """Enumerate on-disk CC transcripts for ``cwd``.
+    """Enumerate on-disk CC transcripts.
 
-    Returns newest-first summaries: ``{session_id, mtime_ms, size, preview?}``.
-    Returns an empty list if the project directory does not exist.
+    Two modes:
+
+    * ``cwd`` set — scan that project's directory only. Rows carry
+      ``{session_id, mtime_ms, size, preview?}``; the cwd is implied by
+      the request and not duplicated on each row.
+    * ``cwd`` None — walk every project directory under
+      ``~/.claude/projects/`` and surface the per-row ``cwd`` extracted
+      from each transcript's first lines (the directory name encoding
+      is lossy, so we read the file). Adds ``model`` opportunistically
+      from the same scan.
+
+    Returns newest-first summaries. Empty list if the projects root
+    doesn't exist.
     """
-    project_dir = project_dir_for_cwd(cwd)
+    if cwd is not None:
+        return _list_for_project_dir(project_dir_for_cwd(cwd), include_meta=False)
+
+    projects_root = Path.home() / ".claude" / "projects"
+    out: list[dict] = []
+    try:
+        project_dirs = sorted(
+            (d for d in projects_root.iterdir() if d.is_dir()),
+            key=lambda d: d.name,
+        )
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        return out
+    for pd in project_dirs:
+        out.extend(_list_for_project_dir(pd, include_meta=True))
+    out.sort(key=lambda r: r["mtime_ms"], reverse=True)
+    return out
+
+
+def _list_for_project_dir(project_dir: Path, *, include_meta: bool) -> list[dict]:
+    """Enumerate ``*.jsonl`` transcripts in a single project directory.
+
+    When ``include_meta`` is true, also reads each transcript's head to
+    extract ``cwd`` and ``model`` — used by the all-cwds scan so each
+    row is self-describing. Skipped on per-cwd queries because the cwd
+    is already known from the request.
+    """
     out: list[dict] = []
     try:
         entries = list(project_dir.iterdir())
@@ -855,6 +891,12 @@ def list_on_disk_sessions(cwd: str | None) -> list[dict]:
             "mtime_ms": int(st.st_mtime * 1000),
             "size": st.st_size,
         }
+        if include_meta:
+            meta = _scan_transcript_metadata(entry)
+            if "cwd" in meta:
+                record["cwd"] = meta["cwd"]
+            if "model" in meta:
+                record["model"] = meta["model"]
         preview = _first_user_preview(entry)
         if preview is not None:
             record["preview"] = preview

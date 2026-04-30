@@ -73,14 +73,60 @@
     },
     "SessionSummary": {
       "type": "object",
-      "description": "One row in a blemeesd.sessions reply.",
+      "description": "One row in a blemeesd.sessions reply. The shape merges disk-derived fields (`mtime_ms`, `size`, `preview`) with live-only fields (`title`, `model`, `cwd`, `started_at_ms`, `last_active_at_ms`, `owner_pid`, `last_seq`, `turn_active`). Disk-only rows lack the live fields; live-only rows lack the disk fields. Clients should treat every optional field as advisory — absence means \"not known\", never \"zero\".",
       "properties": {
         "session_id": { "$ref": "#/$defs/SessionId" },
         "backend": { "$ref": "#/$defs/Backend" },
         "attached": { "type": "boolean" },
-        "mtime_ms": { "type": "integer", "minimum": 0 },
-        "size": { "type": "integer", "minimum": 0 },
-        "preview": { "type": "string" }
+        "mtime_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "On-disk transcript mtime; absent for live-only rows."
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "On-disk transcript size in bytes; absent for live-only rows."
+        },
+        "preview": {
+          "type": "string",
+          "description": "Excerpt of the first user turn from the on-disk transcript; absent for live-only rows."
+        },
+        "cwd": {
+          "type": "string",
+          "description": "Working directory the session is rooted at."
+        },
+        "model": {
+          "type": "string",
+          "description": "Model id last reported by the backend (Claude `claude-sonnet-4-6`, Codex `gpt-5.2-codex`, etc.). Absent for sessions that haven't yet emitted `agent.system_init`."
+        },
+        "title": {
+          "type": "string",
+          "description": "Daemon-derived title from the first observed user message, capped at 80 characters. Absent for sessions that haven't driven a turn."
+        },
+        "started_at_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Wall-clock when the session was first registered with the daemon. Live-only field."
+        },
+        "last_active_at_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Wall-clock of the most recent `agent.result` (or `started_at_ms` if no turn has completed). Live-only field; clients should sort by this in preference to `mtime_ms` when both are present."
+        },
+        "owner_pid": {
+          "$ref": "#/$defs/PeerPid",
+          "description": "PID of the connection currently driving the session. Absent when the session is detached or when the OS does not expose peer credentials."
+        },
+        "last_seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Highest seq the session has produced. Live-only field; matches the `last_seq` carried on `blemeesd.opened` and `blemeesd.watching`."
+        },
+        "turn_active": {
+          "type": "boolean",
+          "description": "True iff the session has a turn in flight (between `agent.user` send and `agent.result` receive). Live-only field."
+        }
       },
       "required": ["session_id", "attached"],
       "additionalProperties": true

@@ -7,22 +7,25 @@ full protocol surface end-to-end without writing a client.
 
 Not a chat UI — no rendering of assistant text, no session management,
 no pretty summaries. This is a tester. For a chat experience, use
-`BlemeesClient` from `blemees.client`.
+the `blemees-tui` package, which ships the chat command as `blemees`.
+
+The console script is `blemeesctl` (renamed from `blemees` in 0.9.0;
+the previous name is now reserved for the chat TUI).
 
 Usage:
 
-    blemees                      # connect to default socket, drop to REPL
-    blemees --socket PATH        # override socket path
-    blemees --no-connect         # start the REPL without auto-connecting
-    blemees --version
+    blemeesctl                   # connect to default socket, drop to REPL
+    blemeesctl --socket PATH     # override socket path
+    blemeesctl --no-connect      # start the REPL without auto-connecting
+    blemeesctl --version
 
 At the REPL:
 
-    blemees> help
-    blemees> open new backend=claude model=sonnet permission_mode=bypassPermissions
-    blemees> send <id> hello there
-    blemees> interrupt <id>
-    blemees> close <id> --delete
+    blemeesctl> help
+    blemeesctl> open new backend=claude model=sonnet permission_mode=bypassPermissions
+    blemeesctl> send <id> hello there
+    blemeesctl> interrupt <id>
+    blemeesctl> close <id> --delete
 """
 
 from __future__ import annotations
@@ -46,7 +49,7 @@ try:
 except ImportError:
     _readline = None  # type: ignore[assignment]
 
-PROMPT = "blemees> "
+PROMPT = "blemeesctl> "
 _ERASE_LINE = "\r\x1b[2K"
 HELP = """\
 Commands — each sends one wire frame, responses are printed as they arrive:
@@ -239,7 +242,7 @@ class Harness:
         await self._send(
             {
                 "type": "blemeesd.hello",
-                "client": f"blemees-cli/{__version__}",
+                "client": f"blemeesctl/{__version__}",
                 "protocol": PROTOCOL_VERSION,
             }
         )
@@ -480,11 +483,13 @@ async def repl(initial_connect: bool, socket_path: str | None) -> int:
     histfile: Path | None = None
     harness = Harness()
     if _readline is not None:
+        # History stays at ~/.blemees_history so existing users don't
+        # lose their command history across the rename.
         histfile = Path.home() / ".blemees_history"
         with contextlib.suppress(FileNotFoundError, OSError):
             _readline.read_history_file(str(histfile))
 
-    print("blemees — interactive wire tester. Type `help` for commands; Ctrl-D to quit.")
+    print("blemeesctl — interactive wire tester. Type `help` for commands; Ctrl-D to quit.")
 
     if initial_connect:
         try:
@@ -525,7 +530,7 @@ async def repl(initial_connect: bool, socket_path: str | None) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="blemees",
+        prog="blemeesctl",
         description="Interactive wire-protocol tester for blemeesd.",
     )
     parser.add_argument("--socket", help="Path to the blemeesd Unix socket")
@@ -538,7 +543,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.version:
-        print(f"blemees {__version__}")
+        print(f"blemeesctl {__version__}")
         return 0
 
     try:

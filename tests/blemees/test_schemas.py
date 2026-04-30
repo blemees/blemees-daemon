@@ -314,13 +314,47 @@ def test_inbound_agent_user_rejects_legacy_text_shorthand(store_and_registry):
     )
 
 
-def test_inbound_list_sessions_requires_cwd(store_and_registry):
+def test_inbound_list_sessions_empty_body_ok(store_and_registry):
+    """Empty body is valid at the schema level — parser-side defaulting
+    fills in `live: true`. The parser is the one that rejects
+    `{"live": false}` without `cwd`; we don't try to encode that
+    cross-field constraint in JSON Schema."""
+    store, reg = store_and_registry
+    _validate(
+        store,
+        reg,
+        "https://blemees/schemas/inbound/blemeesd.list_sessions.json",
+        {"type": "blemeesd.list_sessions"},
+    )
+
+
+def test_inbound_list_sessions_with_cwd_and_live(store_and_registry):
+    store, reg = store_and_registry
+    _validate(
+        store,
+        reg,
+        "https://blemees/schemas/inbound/blemeesd.list_sessions.json",
+        {"type": "blemeesd.list_sessions", "cwd": "/proj", "live": True},
+    )
+
+
+def test_inbound_list_sessions_rejects_non_bool_live(store_and_registry):
     store, reg = store_and_registry
     _assert_invalid(
         store,
         reg,
         "https://blemees/schemas/inbound/blemeesd.list_sessions.json",
-        {"type": "blemeesd.list_sessions"},
+        {"type": "blemeesd.list_sessions", "live": "yes"},
+    )
+
+
+def test_inbound_list_sessions_rejects_empty_cwd(store_and_registry):
+    store, reg = store_and_registry
+    _assert_invalid(
+        store,
+        reg,
+        "https://blemees/schemas/inbound/blemeesd.list_sessions.json",
+        {"type": "blemeesd.list_sessions", "cwd": ""},
     )
 
 
@@ -571,4 +605,66 @@ def test_outbound_sessions_listing_with_backend(store_and_registry):
                 {"session_id": "live", "backend": "codex", "attached": True},
             ],
         },
+    )
+
+
+def test_outbound_sessions_live_only_omits_cwd(store_and_registry):
+    """Whole-daemon (live-only) replies omit `cwd` and carry the rich
+    live fields on each row."""
+    store, reg = store_and_registry
+    _validate(
+        store,
+        reg,
+        "https://blemees/schemas/outbound/blemeesd.sessions.json",
+        {
+            "type": "blemeesd.sessions",
+            "id": "r1",
+            "sessions": [
+                {
+                    "session_id": "abc",
+                    "backend": "claude",
+                    "attached": True,
+                    "cwd": "/home/u/proj",
+                    "model": "claude-sonnet-4-6",
+                    "title": "refactor utils.py",
+                    "started_at_ms": 1745000000000,
+                    "last_active_at_ms": 1745000123000,
+                    "owner_pid": 12345,
+                    "last_seq": 47,
+                    "turn_active": False,
+                },
+            ],
+        },
+    )
+
+
+def test_outbound_session_closed_owner_closed(store_and_registry):
+    store, reg = store_and_registry
+    _validate(
+        store,
+        reg,
+        "https://blemees/schemas/outbound/blemeesd.session_closed.json",
+        {"type": "blemeesd.session_closed", "session_id": "s1", "reason": "owner_closed"},
+    )
+
+
+def test_outbound_session_closed_rejects_unknown_reason(store_and_registry):
+    """Reserved future reasons are added by extending the enum, not by
+    accepting whatever string a misbehaving daemon sends."""
+    store, reg = store_and_registry
+    _assert_invalid(
+        store,
+        reg,
+        "https://blemees/schemas/outbound/blemeesd.session_closed.json",
+        {"type": "blemeesd.session_closed", "session_id": "s1", "reason": "made_up"},
+    )
+
+
+def test_outbound_session_closed_requires_reason(store_and_registry):
+    store, reg = store_and_registry
+    _assert_invalid(
+        store,
+        reg,
+        "https://blemees/schemas/outbound/blemeesd.session_closed.json",
+        {"type": "blemeesd.session_closed", "session_id": "s1"},
     )

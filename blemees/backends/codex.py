@@ -1014,12 +1014,18 @@ def _content_text_blocks(content: Any) -> str | None:
 
 
 def list_on_disk_sessions(cwd: str | None) -> list[dict]:
-    """Enumerate Codex rollout files for ``cwd``.
+    """Enumerate Codex rollout files.
 
-    Walks ``~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`` (newest day
-    first), parses each rollout's embedded ``session_configured`` to
-    filter by ``cwd``, and returns rows of the same shape the Claude
-    backend emits: ``{session_id, mtime_ms, size, preview?, rollout_path}``.
+    Walks ``~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`` newest-day
+    first, capped by :data:`_LIST_MAX_DAYS` and :data:`_LIST_MAX_FILES`.
+    Each candidate's embedded ``session_configured`` is parsed for cwd
+    and model.
+
+    * ``cwd`` set — restrict to rollouts whose ``session_configured.cwd``
+      matches. Rows: ``{session_id, mtime_ms, size, preview?, rollout_path}``.
+    * ``cwd`` None — return rollouts from every cwd. Rows additionally
+      carry ``cwd`` and (when readable) ``model`` so they're
+      self-describing in the merged listing.
 
     ``session_id`` is the Codex ``threadId`` parsed from the filename.
     """
@@ -1082,7 +1088,9 @@ def list_on_disk_sessions(cwd: str | None) -> list[dict]:
                     if sc is None:
                         continue
                     rollout_cwd = sc.get("cwd") if isinstance(sc, dict) else None
-                    if not isinstance(rollout_cwd, str) or rollout_cwd != cwd:
+                    if not isinstance(rollout_cwd, str):
+                        rollout_cwd = None
+                    if cwd is not None and rollout_cwd != cwd:
                         continue
                     try:
                         st = entry.stat()
@@ -1094,6 +1102,13 @@ def list_on_disk_sessions(cwd: str | None) -> list[dict]:
                         "size": st.st_size,
                         "rollout_path": str(entry),
                     }
+                    if cwd is None:
+                        # Self-describing rows for the all-cwds listing.
+                        if rollout_cwd:
+                            record["cwd"] = rollout_cwd
+                        rollout_model = sc.get("model") if isinstance(sc, dict) else None
+                        if isinstance(rollout_model, str) and rollout_model:
+                            record["model"] = rollout_model
                     preview = _first_user_preview_from_rollout(head)
                     if preview is not None:
                         record["preview"] = preview

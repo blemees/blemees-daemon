@@ -496,6 +496,11 @@ class Connection:
             # ``invalid_message`` with the session id so clients can
             # correlate the failure to their open session.
             await self._emit_error(INVALID_MESSAGE, exc.message, session_id=msg.session_id)
+        else:
+            # Once the backend has accepted the user turn, record a
+            # daemon-derived title for ``blemeesd.list_live_sessions``.
+            # Only the first call sets a value; subsequent turns no-op.
+            sess.record_user_message(msg.message)
 
     async def _handle_interrupt(self, msg) -> None:
         # Per spec §5.14, ``blemeesd.interrupt`` is connection-scoped to
@@ -532,48 +537,118 @@ class Connection:
         )
 
     async def _handle_list_sessions(self, msg) -> None:
-        # On-disk transcripts from each backend, dedup-keyed by
-        # ``(backend, session_id)`` so a freak collision between a
-        # claude session id and a codex threadId doesn't fold the rows
-        # together.
+        """Enumerate sessions with composable, independent filters.
+
+        ``cwd`` and ``live`` are filters; absence means "no filter on
+        that axis" — see ``parse_list_sessions`` for the contract.
+
+        * ``include_disk = msg.live is not True`` — when ``live`` is
+          unset or ``False``, walk the on-disk transcripts. Cwd
+          filtering is delegated to the backend helpers; ``cwd=None``
+          there means "every project."
+        * ``include_live = msg.live is not False`` — when ``live`` is
+          unset or ``True``, walk the in-memory ``SessionTable``. Cwd
+          filtering uses ``iter_by_cwd``.
+        * When ``msg.live is False`` the disk pass runs but the live
+          overlay is suppressed; we additionally subtract any
+          ``(backend, session_id)`` keys that *are* currently live, so
+          a session with both an in-memory record and a disk transcript
+          isn't surfaced as "cold."
+
+        Live rows always carry the richer fields (``title``, ``model``,
+        ``started_at_ms``, ``last_active_at_ms``, ``owner_pid``,
+        ``last_seq``, ``turn_active``); disk-only rows keep
+        ``mtime_ms`` / ``size`` / ``preview`` (and, for ``cwd=None``
+        scans, ``cwd`` and ``model`` extracted from the transcript).
+        """
+        include_disk = msg.live is not True
+        include_live = msg.live is not False
+
         merged: dict[tuple[str, str], dict] = {}
-        for row in list_claude_session_files(msg.cwd):
-            key = ("claude", row["session_id"])
-            merged[key] = {**row, "backend": "claude", "attached": False}
-        for row in list_codex_session_files(msg.cwd):
-            key = ("codex", row["session_id"])
-            merged[key] = {**row, "backend": "codex", "attached": False}
-        # Overlay in-memory sessions for the same cwd. Transcripts can lag
-        # the first turn, so a session with no file yet still shows up.
-        for sess in self._sessions.iter_by_cwd(msg.cwd):
-            # For codex, the on-disk row is keyed by threadId, while the
-            # in-memory session is keyed by the daemon's session_id —
-            # which equals the threadId only after the client resumed
-            # from a list_sessions row. Match on whichever id we know.
-            candidate_keys: list[tuple[str, str]] = [(sess.backend_name, sess.session_id)]
-            if sess.backend_name == "codex" and sess.native_session_id:
-                candidate_keys.append(("codex", sess.native_session_id))
-            existing_key: tuple[str, str] | None = None
-            for k in candidate_keys:
-                if k in merged:
-                    existing_key = k
-                    break
-            rec = merged.get(existing_key) if existing_key else None
-            if rec is None:
-                rec = {"session_id": sess.session_id}
-            rec["attached"] = sess.connection_id is not None
-            rec["backend"] = sess.backend_name
-            merged[existing_key or (sess.backend_name, sess.session_id)] = rec
-        sessions = sorted(merged.values(), key=lambda r: r.get("mtime_ms") or 0, reverse=True)
-        self._log.info("session.list", cwd=msg.cwd, count=len(sessions))
-        await self._emit_frame(
-            {
-                "type": "blemeesd.sessions",
-                "id": msg.id,
-                "cwd": msg.cwd,
-                "sessions": sessions,
-            }
+
+        if include_disk:
+            for row in list_claude_session_files(msg.cwd):
+                key = ("claude", row["session_id"])
+                merged[key] = {**row, "backend": "claude", "attached": False}
+            for row in list_codex_session_files(msg.cwd):
+                key = ("codex", row["session_id"])
+                merged[key] = {**row, "backend": "codex", "attached": False}
+
+        if include_live:
+            # cwd filter: per-cwd uses iter_by_cwd; absent uses all.
+            if msg.cwd is not None:
+                live_iter = self._sessions.iter_by_cwd(msg.cwd)
+            else:
+                live_iter = list(self._sessions._sessions.values())
+
+            for sess in live_iter:
+                # For codex, on-disk row is keyed by threadId; in-memory by
+                # the daemon's session_id (== threadId only after resume from
+                # a prior list_sessions row). Match on whichever id we know.
+                candidate_keys: list[tuple[str, str]] = [
+                    (sess.backend_name, sess.session_id)
+                ]
+                if sess.backend_name == "codex" and sess.native_session_id:
+                    candidate_keys.append(("codex", sess.native_session_id))
+                existing_key: tuple[str, str] | None = None
+                for k in candidate_keys:
+                    if k in merged:
+                        existing_key = k
+                        break
+                rec = merged.get(existing_key) if existing_key else None
+
+                owner_pid: int | None = None
+                if sess.connection_id is not None and self._lookup_connection is not None:
+                    owner = self._lookup_connection(sess.connection_id)
+                    if owner is not None:
+                        owner_pid = owner._peer_pid
+                live = sess.live_summary(owner_pid=owner_pid)
+
+                if rec is None:
+                    rec = live
+                else:
+                    # Disk-derived fields stay; live fields overlay on top.
+                    rec.update(live)
+                merged[existing_key or (sess.backend_name, sess.session_id)] = rec
+        elif include_disk:
+            # ``live=False``: a session that's currently in memory is
+            # "live", not "on-disk-only" — even if its transcript is on
+            # disk. Subtract live keys from disk rows so the result is
+            # truly the cold-only set.
+            live_keys: set[tuple[str, str]] = set()
+            sess_iter = (
+                self._sessions.iter_by_cwd(msg.cwd)
+                if msg.cwd is not None
+                else list(self._sessions._sessions.values())
+            )
+            for sess in sess_iter:
+                live_keys.add((sess.backend_name, sess.session_id))
+                if sess.backend_name == "codex" and sess.native_session_id:
+                    live_keys.add(("codex", sess.native_session_id))
+            for key in live_keys:
+                merged.pop(key, None)
+
+        # Prefer last_active_at_ms (precise daemon-side) over mtime_ms
+        # (disk lag) for sort. Disk-only rows fall back to mtime_ms.
+        sessions = sorted(
+            merged.values(),
+            key=lambda r: r.get("last_active_at_ms") or r.get("mtime_ms") or 0,
+            reverse=True,
         )
+        self._log.info(
+            "session.list",
+            cwd=msg.cwd,
+            live=msg.live,
+            count=len(sessions),
+        )
+        reply: dict[str, Any] = {
+            "type": "blemeesd.sessions",
+            "id": msg.id,
+            "sessions": sessions,
+        }
+        if msg.cwd is not None:
+            reply["cwd"] = msg.cwd
+        await self._emit_frame(reply)
 
     async def _handle_close(self, msg) -> None:
         # Per spec §5.14, ``blemeesd.close`` is connection-scoped to the
@@ -587,6 +662,20 @@ class Connection:
             return
         self._log.info("session.close", session_id=msg.session_id, delete=msg.delete)
         self._owned_sessions.discard(msg.session_id)
+        # Notify any watchers *before* the session record is gone so
+        # they can flip their UI to a closed-state view. We deliberately
+        # skip seq-tagging / ring persistence: a watcher that reattaches
+        # later sees ``session_unknown`` and should treat that as the
+        # close anyway.
+        sess = self._sessions.try_get(msg.session_id)
+        if sess is not None:
+            await sess.broadcast_to_watchers(
+                {
+                    "type": "blemeesd.session_closed",
+                    "session_id": msg.session_id,
+                    "reason": "owner_closed",
+                }
+            )
         await self._sessions.remove(msg.session_id, delete_file=msg.delete)
         await self._emit_frame(
             {"type": "blemeesd.closed", "id": msg.id, "session_id": msg.session_id}

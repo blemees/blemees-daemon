@@ -1,9 +1,9 @@
-"""Tests for the interactive wire-protocol tester (`blemees` CLI).
+"""Tests for the interactive wire-protocol tester (`blemeesctl` CLI).
 
 We don't drive the actual REPL loop here — the end-to-end value of
 that lives on top of the daemon e2e suite. These tests cover the
 pieces that benefit from being verified in isolation: the field
-coercion, and the command dispatcher (using a recording harness so we
+coercion and the command dispatcher (using a recording harness so we
 can assert the exact wire frame each command produces).
 """
 

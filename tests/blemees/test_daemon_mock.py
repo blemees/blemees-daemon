@@ -460,12 +460,16 @@ def _seed_transcript(
         else:
             os.environ["HOME"] = old_home
     project_dir.mkdir(parents=True, exist_ok=True)
-    lines = [json.dumps({"type": "system", "subtype": "init"})]
+    # Real CC transcripts carry `cwd` at the top level on most records;
+    # mirror that so the daemon's metadata-scan finds it during all-cwds
+    # listings.
+    lines = [json.dumps({"type": "system", "subtype": "init", "cwd": cwd})]
     if preview is not None:
         lines.append(
             json.dumps(
                 {
                     "type": "user",
+                    "cwd": cwd,
                     "message": {"role": "user", "content": preview},
                 }
             )
@@ -476,11 +480,157 @@ def _seed_transcript(
     return path
 
 
-async def test_list_sessions_requires_cwd(client_factory):
+async def test_list_sessions_empty_body_unions_disk_and_live(
+    client_factory, fake_mode, tmp_path, monkeypatch
+):
+    """No filters → walk every project on disk AND every live session.
+    The union is returned; reply omits top-level `cwd`."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cwd_a = str(tmp_path / "a")
+    cwd_b = str(tmp_path / "b")
+    Path(cwd_a).mkdir(parents=True)
+    Path(cwd_b).mkdir(parents=True)
+    _seed_transcript(tmp_path, cwd_a, "cold-a", "old A", 1_700_000_000)
+    _seed_transcript(tmp_path, cwd_b, "cold-b", "old B", 1_700_000_100)
+
+    fake_mode("normal")
     client = await client_factory()
+    await client.send(
+        {
+            "type": "blemeesd.open",
+            "id": "open-1",
+            "session_id": "warm",
+            "backend": "claude",
+            "options": {"claude": {"tools": "", "cwd": cwd_a}},
+        }
+    )
+    await client.wait_for(lambda e: e.get("type") == "blemeesd.opened")
+
     await client.send({"type": "blemeesd.list_sessions", "id": "r1"})
-    err = await client.wait_for(lambda e: e.get("type") == "blemeesd.error")
-    assert err["code"] == "invalid_message"
+    reply = await client.wait_for(lambda e: e.get("type") == "blemeesd.sessions")
+    assert reply["id"] == "r1"
+    assert "cwd" not in reply  # no filter echoed
+    ids = {s["session_id"] for s in reply["sessions"]}
+    assert {"warm", "cold-a", "cold-b"}.issubset(ids)
+
+    # All-cwds disk rows carry their own cwd so clients can group.
+    rows = {s["session_id"]: s for s in reply["sessions"]}
+    assert rows["cold-a"]["cwd"] == cwd_a
+    assert rows["cold-b"]["cwd"] == cwd_b
+    # The live row keeps its rich fields.
+    assert rows["warm"]["attached"] is True
+    assert rows["warm"]["cwd"] == cwd_a
+
+
+async def test_list_sessions_live_true_returns_all_live(
+    client_factory, fake_mode, tmp_path
+):
+    """`live:true` skips the disk scan; live overlay across all cwds."""
+    fake_mode("normal")
+    cwd_a = tmp_path / "a"
+    cwd_b = tmp_path / "b"
+    cwd_a.mkdir()
+    cwd_b.mkdir()
+    client = await client_factory()
+    for sid, cwd in (("liveA", str(cwd_a)), ("liveB", str(cwd_b))):
+        await client.send(
+            {
+                "type": "blemeesd.open",
+                "id": f"open-{sid}",
+                "session_id": sid,
+                "backend": "claude",
+                "options": {"claude": {"tools": "", "cwd": cwd}},
+            }
+        )
+        await client.wait_for(
+            lambda e, s=sid: e.get("type") == "blemeesd.opened" and e.get("session_id") == s
+        )
+
+    await client.send({"type": "blemeesd.list_sessions", "id": "r1", "live": True})
+    reply = await client.wait_for(lambda e: e.get("type") == "blemeesd.sessions")
+    ids = {s["session_id"] for s in reply["sessions"]}
+    assert {"liveA", "liveB"}.issubset(ids)
+    assert "cwd" not in reply
+    rows = {s["session_id"]: s for s in reply["sessions"]}
+    assert rows["liveA"]["attached"] is True
+    assert rows["liveA"]["backend"] == "claude"
+    assert rows["liveA"]["cwd"] == str(cwd_a)
+    assert "started_at_ms" in rows["liveA"]
+    assert "last_seq" in rows["liveA"]
+    assert rows["liveA"]["turn_active"] is False
+
+
+async def test_list_sessions_live_false_excludes_currently_live(
+    client_factory, fake_mode, tmp_path, monkeypatch
+):
+    """`live:false` returns cold sessions only. A session with both an
+    in-memory record and a disk transcript counts as live, not cold,
+    and is excluded from the result."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    work = tmp_path / "work"
+    work.mkdir()
+    cwd = str(work)
+    _seed_transcript(tmp_path, cwd, "old-cold", "long ago", 1_700_000_000)
+    # `warm` exists both as an open live session and as an on-disk
+    # transcript (we seed it before opening, then open with the same
+    # session_id so the daemon's in-memory record overlays the disk).
+    _seed_transcript(tmp_path, cwd, "warm", "in flight", 1_700_000_100)
+
+    fake_mode("normal")
+    client = await client_factory()
+    await client.send(
+        {
+            "type": "blemeesd.open",
+            "id": "open-1",
+            "session_id": "warm",
+            "backend": "claude",
+            "options": {"claude": {"tools": "", "cwd": cwd}},
+            "resume": True,
+        }
+    )
+    await client.wait_for(lambda e: e.get("type") == "blemeesd.opened")
+
+    await client.send(
+        {"type": "blemeesd.list_sessions", "id": "r1", "cwd": cwd, "live": False}
+    )
+    reply = await client.wait_for(lambda e: e.get("type") == "blemeesd.sessions")
+    ids = {s["session_id"] for s in reply["sessions"]}
+    assert "old-cold" in ids
+    assert "warm" not in ids  # live, so excluded from the cold-only set
+
+
+async def test_list_sessions_cwd_plus_live_true_skips_disk(
+    client_factory, fake_mode, tmp_path, monkeypatch
+):
+    """`cwd:X, live:true` filters to that cwd's live sessions and
+    deliberately ignores on-disk transcripts."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    work = tmp_path / "work"
+    work.mkdir()
+    cwd = str(work)
+    _seed_transcript(tmp_path, cwd, "old-cold", "stale", 1_700_000_000)
+
+    fake_mode("normal")
+    client = await client_factory()
+    await client.send(
+        {
+            "type": "blemeesd.open",
+            "id": "open-1",
+            "session_id": "warm",
+            "backend": "claude",
+            "options": {"claude": {"tools": "", "cwd": cwd}},
+        }
+    )
+    await client.wait_for(lambda e: e.get("type") == "blemeesd.opened")
+
+    await client.send(
+        {"type": "blemeesd.list_sessions", "id": "r1", "cwd": cwd, "live": True}
+    )
+    reply = await client.wait_for(lambda e: e.get("type") == "blemeesd.sessions")
+    ids = {s["session_id"] for s in reply["sessions"]}
+    assert "warm" in ids
+    assert "old-cold" not in ids  # disk scan was skipped
+    assert reply["cwd"] == cwd
 
 
 async def test_list_sessions_empty_for_unknown_cwd(client_factory, tmp_path, monkeypatch):
@@ -1029,6 +1179,71 @@ async def test_watch_unknown_session_errors(client_factory):
     await client.send({"type": "blemeesd.watch", "id": "w1", "session_id": "ghost"})
     err = await client.wait_for(lambda e: e.get("type") == "blemeesd.error")
     assert err["code"] == "session_unknown"
+
+
+async def test_watcher_receives_session_closed_when_owner_closes(
+    client_factory, fake_mode
+):
+    """When the owner sends `blemeesd.close`, every watcher gets a
+    `blemeesd.session_closed{reason:"owner_closed"}` notification before
+    the session is removed."""
+    fake_mode("normal")
+    owner = await client_factory()
+    watcher = await client_factory()
+    await owner.send(
+        {
+            "type": "blemeesd.open",
+            "id": "r1",
+            "session_id": "closer",
+            "backend": "claude",
+            "options": {"claude": {"tools": ""}},
+        }
+    )
+    await owner.wait_for(lambda e: e.get("type") == "blemeesd.opened")
+    await watcher.send({"type": "blemeesd.watch", "id": "w1", "session_id": "closer"})
+    await watcher.wait_for(lambda e: e.get("type") == "blemeesd.watching")
+
+    await owner.send(
+        {"type": "blemeesd.close", "id": "c1", "session_id": "closer", "delete": False}
+    )
+    closed_ack = await owner.wait_for(lambda e: e.get("type") == "blemeesd.closed")
+    assert closed_ack["session_id"] == "closer"
+
+    notice = await watcher.wait_for(
+        lambda e: e.get("type") == "blemeesd.session_closed"
+    )
+    assert notice["session_id"] == "closer"
+    assert notice["reason"] == "owner_closed"
+
+
+async def test_session_closed_not_sent_to_owner(client_factory, fake_mode):
+    """The closer does NOT also receive `session_closed` — they get the
+    `closed` ack instead. Watchers and owners get distinct signals."""
+    fake_mode("normal")
+    client = await client_factory()
+    await client.send(
+        {
+            "type": "blemeesd.open",
+            "id": "r1",
+            "session_id": "solo",
+            "backend": "claude",
+            "options": {"claude": {"tools": ""}},
+        }
+    )
+    await client.wait_for(lambda e: e.get("type") == "blemeesd.opened")
+    await client.send(
+        {"type": "blemeesd.close", "id": "c1", "session_id": "solo", "delete": False}
+    )
+    await client.wait_for(lambda e: e.get("type") == "blemeesd.closed")
+
+    # Drain anything else; assert no session_closed leaked back to the owner.
+    await asyncio.sleep(0.1)
+    try:
+        while True:
+            evt = await client.recv(timeout=0.1)
+            assert evt.get("type") != "blemeesd.session_closed", evt
+    except TimeoutError:
+        pass
 
 
 # ---------------------------------------------------------------------------

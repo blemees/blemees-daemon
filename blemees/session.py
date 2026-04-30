@@ -91,6 +91,14 @@ class Session:
     )
     _usage_path: Path | None = None
 
+    # Wall-clock when the session was first registered; surfaced on
+    # `blemeesd.live_sessions` so clients can sort by age. Set on
+    # ``SessionTable.new_session``.
+    started_at_ms: int | None = None
+    # Daemon-derived title from the first observed user message, capped
+    # at 80 characters. Absent until the session has driven a turn.
+    title: str | None = None
+
     extra: dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
@@ -259,6 +267,101 @@ class Session:
     def remove_watcher(self, connection_id: int) -> bool:
         """Unsubscribe a watcher. Returns ``True`` if it was registered."""
         return self._watchers.pop(connection_id, None) is not None
+
+    async def broadcast_to_watchers(self, frame: dict) -> None:
+        """Send a one-shot notification frame to every watcher.
+
+        Unlike :meth:`on_event`, the frame is **not** seq-tagged, **not**
+        appended to the ring, and **not** persisted. It is purely a
+        connection-level signal (e.g. ``blemeesd.session_closed``). Dead
+        writers are silently dropped, matching the fan-out policy in
+        ``on_event``.
+        """
+        if not self._watchers:
+            return
+        dead: list[int] = []
+        for conn_id, w in self._watchers.items():
+            try:
+                await w(frame)
+            except Exception:
+                dead.append(conn_id)
+        for conn_id in dead:
+            self._watchers.pop(conn_id, None)
+
+    # ------------------------------------------------------------------
+    # Title (derived from first user message)
+    # ------------------------------------------------------------------
+
+    _TITLE_MAX_CHARS = 80
+
+    def record_user_message(self, message: dict) -> None:
+        """Capture a session title from the first observed user turn.
+
+        No-op if a title is already set, or if the message has no
+        extractable text. Multimodal arrays concatenate their text
+        blocks (non-text blocks are skipped).
+        """
+        if self.title is not None:
+            return
+        content = message.get("content")
+        text: str | None = None
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    t = block.get("text")
+                    if isinstance(t, str):
+                        parts.append(t)
+            if parts:
+                text = " ".join(parts)
+        if not text:
+            return
+        # Collapse newlines / runs of whitespace before the cap so the
+        # title reads as a single line in a sidebar.
+        compact = " ".join(text.split())
+        if not compact:
+            return
+        if len(compact) > self._TITLE_MAX_CHARS:
+            compact = compact[: self._TITLE_MAX_CHARS - 1].rstrip() + "…"
+        self.title = compact
+
+    # ------------------------------------------------------------------
+    # Live summary (for blemeesd.list_live_sessions)
+    # ------------------------------------------------------------------
+
+    def live_summary(self, *, owner_pid: int | None) -> dict[str, Any]:
+        """Build one row for a ``blemeesd.live_sessions`` reply.
+
+        Optional fields (``cwd``, ``model``, ``title``, ``owner_pid``,
+        ``last_active_at_ms``) are omitted entirely when not known —
+        callers should not see ``null`` on the wire (matches the
+        spec-wide convention for absent optional fields).
+        """
+        out: dict[str, Any] = {
+            "session_id": self.session_id,
+            "backend": self.backend_name,
+            "attached": self.connection_id is not None,
+            "last_seq": self.seq,
+            "turn_active": (
+                self.backend is not None and self.backend.running and self.backend.turn_active
+            ),
+        }
+        if self.cwd:
+            out["cwd"] = self.cwd
+        if self.last_model:
+            out["model"] = self.last_model
+        if self.title:
+            out["title"] = self.title
+        if self.started_at_ms is not None:
+            out["started_at_ms"] = self.started_at_ms
+        last_active = self.last_turn_at_ms or self.started_at_ms
+        if last_active is not None:
+            out["last_active_at_ms"] = last_active
+        if self.connection_id is not None and owner_pid is not None:
+            out["owner_pid"] = owner_pid
+        return out
 
     # ------------------------------------------------------------------
     # Log setup
@@ -437,6 +540,7 @@ class SessionTable:
             cwd=open_msg.options.get("cwd"),
             backend_name=open_msg.backend,
             ring=RingBuffer(self.ring_buffer_size),
+            started_at_ms=int(time.time() * 1000),
         )
         if self.event_log_dir:
             sess.enable_durable_log(self.event_log_dir)
