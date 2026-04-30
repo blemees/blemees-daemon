@@ -86,7 +86,188 @@ async def test_normal_turn_produces_result(monkeypatch):
         assert "agent.message" in kinds
         assert events[-1]["type"] == "agent.result"
         assert events[-1]["backend"] == "claude"
+        # turn_id and time_to_first_token_ms are daemon-synthesised so the
+        # claude backend's terminal frame matches codex's shape.
+        assert isinstance(events[-1].get("turn_id"), str)
+        assert isinstance(events[-1].get("time_to_first_token_ms"), int)
+        assert events[-1]["time_to_first_token_ms"] >= 0
         assert proc.turn_active is False
+    finally:
+        await proc.close()
+
+
+async def test_send_user_turn_emits_task_started_notice(monkeypatch):
+    """The daemon synthesises `agent.notice{category:"task_started"}` so
+    Claude has the same turn-start hook codex emits natively."""
+    monkeypatch.setenv("BLEMEES_FAKE_MODE", "normal")
+    queue: asyncio.Queue = asyncio.Queue()
+    logger = configure("error")
+    proc = ClaudeBackend(
+        session_id="s1",
+        argv=_make_argv("s1"),
+        cwd=None,
+        on_event=queue.put,
+        logger=logger,
+    )
+    await proc.spawn()
+    try:
+        await proc.send_user_turn({"role": "user", "content": "hi"})
+        events = await _drain_until_result(queue, "s1")
+        notices = [e for e in events if e.get("type") == "agent.notice"]
+        task_started = [n for n in notices if n.get("category") == "task_started"]
+        assert len(task_started) == 1
+        ts = task_started[0]
+        assert ts["backend"] == "claude"
+        assert ts["level"] == "info"
+        assert isinstance(ts["data"]["turn_id"], str)
+        assert isinstance(ts["data"]["started_at_ms"], int)
+        # The same turn_id surfaces on the closing agent.result.
+        assert events[-1].get("turn_id") == ts["data"]["turn_id"]
+    finally:
+        await proc.close()
+
+
+async def test_system_init_carries_capabilities(monkeypatch, tmp_path):
+    """Capabilities are synthesised from options.claude.* so claude's
+    system_init parallels codex's shape."""
+    monkeypatch.setenv("BLEMEES_FAKE_MODE", "normal")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    queue: asyncio.Queue = asyncio.Queue()
+    logger = configure("error")
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    options = {
+        "tools": "",
+        "permission_mode": "bypassPermissions",
+        "effort": "high",
+    }
+    proc = ClaudeBackend(
+        session_id="s1",
+        argv=build_argv(FAKE_CLAUDE, session_id="s1", options=options, for_resume=False),
+        cwd=str(cwd),
+        options=options,
+        on_event=queue.put,
+        logger=logger,
+    )
+    await proc.spawn()
+    try:
+        await proc.send_user_turn({"role": "user", "content": "hi"})
+        events = await _drain_until_result(queue, "s1")
+        init = next(e for e in events if e["type"] == "agent.system_init")
+        caps = init["capabilities"]
+        assert caps["permission_mode"] == "bypassPermissions"
+        assert caps["reasoning_effort"] == "high"  # renamed from `effort` for codex parity
+        # rollout_path mirrors codex.session_configured.rollout_path.
+        assert caps["rollout_path"].endswith("/s1.jsonl")
+        assert "/.claude/projects/" in caps["rollout_path"]
+    finally:
+        await proc.close()
+
+
+async def test_crash_mid_turn_synthesises_agent_result(monkeypatch):
+    """When the subprocess crashes mid-turn, the daemon synthesises a
+    closing agent.result{subtype:"error"} so clients waiting on
+    agent.result aren't left hanging (spec §5.6)."""
+    monkeypatch.setenv("BLEMEES_FAKE_MODE", "crash")
+    queue: asyncio.Queue = asyncio.Queue()
+    logger = configure("error")
+    proc = ClaudeBackend(
+        session_id="s1",
+        argv=_make_argv("s1"),
+        cwd=None,
+        on_event=queue.put,
+        logger=logger,
+    )
+    await proc.spawn()
+    try:
+        await proc.send_user_turn({"role": "user", "content": "boom"})
+        saw_error_frame = False
+        saw_synth_result = False
+        for _ in range(40):
+            evt = await asyncio.wait_for(queue.get(), timeout=5.0)
+            if evt.get("type") == "blemeesd.error" and evt.get("code") == "backend_crashed":
+                saw_error_frame = True
+            if evt.get("type") == "agent.result" and evt.get("subtype") == "error":
+                saw_synth_result = True
+                # Synth result carries the turn_id allocated at send_user_turn.
+                assert isinstance(evt.get("turn_id"), str)
+                assert evt["error"]["code"] == "backend_crashed"
+                assert "stderr tail" in evt["error"]["message"]
+                break
+        assert saw_error_frame, "blemeesd.error{backend_crashed} not emitted"
+        assert saw_synth_result, "synth agent.result{error} not emitted"
+    finally:
+        await proc.close()
+
+
+async def test_auth_failure_mid_turn_synthesises_agent_result(monkeypatch):
+    """Mid-turn auth failure closes the turn cleanly with a synthesised
+    agent.result{subtype:"error", error.code:"auth_failed"}."""
+    monkeypatch.setenv("BLEMEES_FAKE_MODE", "oauth_midturn")
+    queue: asyncio.Queue = asyncio.Queue()
+    logger = configure("error")
+    proc = ClaudeBackend(
+        session_id="s1",
+        argv=_make_argv("s1"),
+        cwd=None,
+        on_event=queue.put,
+        logger=logger,
+    )
+    await proc.spawn()
+    try:
+        await proc.send_user_turn({"role": "user", "content": "boom"})
+        saw_auth = False
+        saw_synth = False
+        for _ in range(40):
+            evt = await asyncio.wait_for(queue.get(), timeout=5.0)
+            if evt.get("code") == "auth_failed":
+                saw_auth = True
+            if evt.get("type") == "agent.result" and evt.get("subtype") == "error":
+                if evt.get("error", {}).get("code") == "auth_failed":
+                    saw_synth = True
+                    assert isinstance(evt.get("turn_id"), str)
+                    break
+        assert saw_auth, "blemeesd.error{auth_failed} not emitted"
+        assert saw_synth, "synth agent.result{error} for auth not emitted"
+    finally:
+        await proc.close()
+
+
+async def test_interrupt_synth_result_carries_turn_metadata(monkeypatch):
+    """The synthesised agent.result{interrupted} stamps the per-turn
+    metadata (turn_id, time_to_first_token_ms when a delta was seen)."""
+    monkeypatch.setenv("BLEMEES_FAKE_MODE", "slow")
+    queue: asyncio.Queue = asyncio.Queue()
+    logger = configure("error")
+    proc = ClaudeBackend(
+        session_id="s1",
+        argv=_make_argv("s1"),
+        cwd=None,
+        on_event=queue.put,
+        logger=logger,
+    )
+    await proc.spawn()
+    try:
+        await proc.send_user_turn({"role": "user", "content": "go"})
+        # Drain until we've seen at least one delta, so first-token time is set.
+        seen_delta = False
+        while not seen_delta:
+            evt = await asyncio.wait_for(queue.get(), timeout=5.0)
+            if evt.get("type") == "agent.delta":
+                seen_delta = True
+        await proc.interrupt()
+        # Wait for the synthesised agent.result.
+        for _ in range(20):
+            evt = await asyncio.wait_for(queue.get(), timeout=5.0)
+            if evt.get("type") == "agent.result" and evt.get("subtype") == "interrupted":
+                assert isinstance(evt.get("turn_id"), str)
+                # We saw a delta, so TTFT must have been measured.
+                assert isinstance(evt.get("time_to_first_token_ms"), int)
+                assert evt["time_to_first_token_ms"] >= 0
+                break
+        else:  # pragma: no cover - test diagnostic
+            raise AssertionError("interrupted result never arrived")
+        monkeypatch.setenv("BLEMEES_FAKE_MODE", "normal")
     finally:
         await proc.close()
 

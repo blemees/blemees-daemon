@@ -25,6 +25,7 @@ import json
 import re
 import signal
 import time
+import uuid
 from collections import deque
 from collections.abc import Iterable
 from pathlib import Path
@@ -83,6 +84,7 @@ class ClaudeBackend:
         cwd: str | None,
         on_event: EventCallback,
         logger,
+        options: dict[str, Any] | None = None,
         stderr_rate_lines: int = 50,
         stderr_rate_window_s: float = 10.0,
         include_raw_events: bool = False,
@@ -90,6 +92,7 @@ class ClaudeBackend:
         self.session_id = session_id
         self._argv = argv
         self._cwd = cwd
+        self._options = options or {}
         self._on_event = on_event
         self._log = logger.bind(session_id=session_id, backend=self.backend)
         self._stderr_limit = _StderrRateLimiter(stderr_rate_lines, stderr_rate_window_s)
@@ -103,6 +106,17 @@ class ClaudeBackend:
         self._auth_emitted: bool = False
         self._reader_tasks: list[asyncio.Task] = []
         self._stdin_lock = asyncio.Lock()
+
+        # Per-turn state for daemon-side turn_id and TTFT measurement.
+        # Codex gets these natively from `task_complete`; for parity we
+        # measure them on the daemon side for Claude.
+        self._current_turn_id: str | None = None
+        self._turn_started_at_ms: int | None = None
+        self._first_token_at_ms: int | None = None
+        # Tracks whether the current turn has already been finalised by a
+        # synthesised `agent.result` (e.g. mid-turn auth failure). Stops
+        # `_watch_exit` from emitting a duplicate close on the same turn.
+        self._turn_finalized: bool = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -146,6 +160,12 @@ class ClaudeBackend:
         """Write one stream-json line on the child's stdin.
 
         Raises :class:`SessionBusyError` if a turn is already in flight.
+        Allocates a per-turn ``turn_id`` and records the start timestamp so
+        the synthesised metadata (``turn_id`` /
+        ``time_to_first_token_ms``) on the eventual ``agent.result`` is
+        symmetrical with what codex emits natively. Also emits a
+        synthesised ``agent.notice{category:"task_started"}`` so clients
+        get a turn-start hook on both backends.
         """
         if self.proc is None or self.proc.returncode is not None:
             raise SpawnFailedError("subprocess not running")
@@ -154,13 +174,31 @@ class ClaudeBackend:
         line = build_user_stdin_line(session_id=self.session_id, message=message)
         async with self._stdin_lock:
             self.turn_active = True
+            self._turn_finalized = False
+            self._current_turn_id = uuid.uuid4().hex
+            self._turn_started_at_ms = int(time.time() * 1000)
+            self._first_token_at_ms = None
             assert self.proc.stdin is not None
             self.proc.stdin.write(line)
             try:
                 await self.proc.stdin.drain()
             except (ConnectionResetError, BrokenPipeError) as exc:
                 self.turn_active = False
+                self._reset_turn_state()
                 raise SpawnFailedError(f"stdin write failed: {exc}") from exc
+
+        await self._on_event(
+            {
+                "type": "agent.notice",
+                "level": "info",
+                "category": "task_started",
+                "data": {
+                    "turn_id": self._current_turn_id,
+                    "started_at_ms": self._turn_started_at_ms,
+                },
+                "backend": self.backend,
+            }
+        )
 
     # ------------------------------------------------------------------
     # Interrupt + close
@@ -202,23 +240,20 @@ class ClaudeBackend:
         """
         if not self.turn_active:
             return False
+        # Capture turn metadata before respawn clears the per-turn state.
+        synth = self._build_synth_result(subtype="interrupted")
         self._closing = True  # suppress the reader's crash report
         await self._kill()
         # Readers will unwind via _watch_exit; await their completion so that
         # the respawn starts cleanly.
         await self._drain_readers()
         self.turn_active = False
+        self._turn_finalized = True
+        self._reset_turn_state()
         self._closing = False
         await self.respawn_with_resume()
         asyncio.create_task(
-            self._on_event(
-                {
-                    "type": "agent.result",
-                    "subtype": "interrupted",
-                    "num_turns": 1,
-                    "backend": self.backend,
-                }
-            ),
+            self._on_event(synth),
             name=f"claude-synth-interrupted-{self.session_id}",
         )
         return True
@@ -284,13 +319,21 @@ class ClaudeBackend:
                 # session_id + seq, but we set `backend` here because it's
                 # backend-specific.
                 frame["backend"] = self.backend
-                # `agent.system_init` doesn't get `native_session_id` from
-                # CC's wire — it's the same as our session id (the value we
-                # passed via `--session-id`).
-                if frame.get("type") == "agent.system_init" and "native_session_id" not in frame:
-                    frame["native_session_id"] = self.session_id
-                if frame.get("type") in TURN_END_TYPES:
+                ftype = frame.get("type")
+                if ftype == "agent.system_init":
+                    if "native_session_id" not in frame:
+                        # CC's wire doesn't carry `native_session_id`; it's
+                        # the same as our session id (passed via `--session-id`).
+                        frame["native_session_id"] = self.session_id
+                    self._inject_capabilities(frame)
+                elif ftype == "agent.delta" and self._first_token_at_ms is None:
+                    # First delta of the turn — record for TTFT measurement.
+                    self._first_token_at_ms = int(time.time() * 1000)
+                if ftype in TURN_END_TYPES:
+                    self._stamp_turn_metadata(frame)
                     self.turn_active = False
+                    self._turn_finalized = True
+                    self._reset_turn_state()
                 await self._on_event(frame)
 
     async def _read_stderr(self) -> None:
@@ -312,15 +355,28 @@ class ClaudeBackend:
             # Auth-failure detection (§9.2); emitted at most once per spawn.
             if not self._auth_emitted and any(p in line for p in _AUTH_FAIL_PATTERNS):
                 self._auth_emitted = True
+                auth_msg = "Run `claude auth` to re-authenticate."
                 await self._on_event(
                     {
                         "type": "blemeesd.error",
                         "session_id": self.session_id,
                         "backend": self.backend,
                         "code": AUTH_FAILED,
-                        "message": "Run `claude auth` to re-authenticate.",
+                        "message": auth_msg,
                     }
                 )
+                # Close the in-flight turn so clients waiting on
+                # `agent.result` aren't left hanging. Mirrors the codex
+                # backend's `_handle_turn_response → finalize_error` path.
+                if self.turn_active and not self._turn_finalized:
+                    synth = self._build_synth_result(
+                        subtype="error",
+                        error={"code": AUTH_FAILED, "message": auth_msg},
+                    )
+                    self.turn_active = False
+                    self._turn_finalized = True
+                    self._reset_turn_state()
+                    await self._on_event(synth)
                 continue
 
             if self._stderr_limit.allow():
@@ -341,20 +397,105 @@ class ClaudeBackend:
         # Crash mid-turn (or unexpected exit): surface to the client.
         if self.turn_active or rc != 0:
             tail = " | ".join(self._stderr_tail) or f"exit {rc}"
+            crash_msg = f"stderr tail: {tail}"[:2048]
             await self._on_event(
                 {
                     "type": "blemeesd.error",
                     "session_id": self.session_id,
                     "backend": self.backend,
                     "code": BACKEND_CRASHED,
-                    "message": f"stderr tail: {tail}"[:2048],
+                    "message": crash_msg,
                 }
             )
+            # Synthesise a closing `agent.result` so clients see a clean
+            # turn end on backend crash. Spec §5.6 says result is always
+            # the last frame for a turn — this restores that invariant
+            # when the child exits before emitting its own `result`. The
+            # `_turn_finalized` guard avoids a double close after
+            # mid-turn auth-failure synthesis.
+            if self.turn_active and not self._turn_finalized:
+                synth = self._build_synth_result(
+                    subtype="error",
+                    error={"code": BACKEND_CRASHED, "message": crash_msg},
+                )
+                self._turn_finalized = True
+                self._reset_turn_state()
+                await self._on_event(synth)
         self.turn_active = False
 
     @property
     def running(self) -> bool:
         return self.proc is not None and self.proc.returncode is None
+
+    # ------------------------------------------------------------------
+    # Synthesis / per-turn metadata helpers
+    # ------------------------------------------------------------------
+
+    def _inject_capabilities(self, frame: dict[str, Any]) -> None:
+        """Populate ``agent.system_init.capabilities`` for Claude.
+
+        CC's wire-level ``system{init}`` event carries no capabilities
+        block. We synthesise one from the open-time ``options.claude.*``
+        so the frame has the same shape as Codex's
+        ``session_configured`` translation. Field names mirror Codex
+        where the concept overlaps (``reasoning_effort``, ``rollout_path``).
+        """
+        caps = dict(frame.get("capabilities") or {})
+        opts = self._options
+        permission_mode = opts.get("permission_mode")
+        if isinstance(permission_mode, str):
+            caps["permission_mode"] = permission_mode
+        effort = opts.get("effort")
+        if isinstance(effort, str):
+            caps["reasoning_effort"] = effort
+        try:
+            rollout = session_file_path(self._cwd, self.session_id)
+            caps["rollout_path"] = str(rollout)
+        except Exception:  # pragma: no cover - defensive
+            pass
+        if caps:
+            frame["capabilities"] = caps
+
+    def _stamp_turn_metadata(self, frame: dict[str, Any]) -> None:
+        """Attach ``turn_id`` + ``time_to_first_token_ms`` to a result-shaped frame.
+
+        Mirrors the data Codex carries natively on its synthesised
+        ``agent.result``. Daemon-side TTFT is wall-clock from
+        ``send_user_turn`` to the first ``agent.delta``; ``turn_id`` is
+        a per-turn UUID hex allocated in ``send_user_turn``.
+        """
+        if self._current_turn_id is not None:
+            frame.setdefault("turn_id", self._current_turn_id)
+        if (
+            self._first_token_at_ms is not None
+            and self._turn_started_at_ms is not None
+        ):
+            ttft = self._first_token_at_ms - self._turn_started_at_ms
+            if ttft >= 0:
+                frame.setdefault("time_to_first_token_ms", ttft)
+
+    def _build_synth_result(
+        self,
+        *,
+        subtype: str,
+        error: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Construct a synthesised ``agent.result`` with current turn metadata."""
+        synth: dict[str, Any] = {
+            "type": "agent.result",
+            "subtype": subtype,
+            "num_turns": 1,
+            "backend": self.backend,
+        }
+        if error is not None:
+            synth["error"] = error
+        self._stamp_turn_metadata(synth)
+        return synth
+
+    def _reset_turn_state(self) -> None:
+        self._current_turn_id = None
+        self._turn_started_at_ms = None
+        self._first_token_at_ms = None
 
 
 # ---------------------------------------------------------------------------

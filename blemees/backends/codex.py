@@ -659,15 +659,28 @@ class CodexBackend:
             return
         if self.turn_active or rc != 0:
             tail = " | ".join(self._stderr_tail) or f"exit {rc}"
+            crash_msg = f"stderr tail: {tail}"[:2048]
             await self._on_event(
                 {
                     "type": "blemeesd.error",
                     "session_id": self.session_id,
                     "backend": self.backend,
                     "code": BACKEND_CRASHED,
-                    "message": f"stderr tail: {tail}"[:2048],
+                    "message": crash_msg,
                 }
             )
+            # Synthesise a closing `agent.result` so clients see a clean
+            # turn end on backend crash. Spec §5.6 says result is always
+            # the last frame for a turn — this restores that invariant
+            # when the child exits before the JSON-RPC response (or a
+            # `turn_aborted` event) lands. Mirrors the Claude backend.
+            if self.turn_active:
+                synth = self._translator.finalize_error(
+                    {"code": BACKEND_CRASHED, "message": crash_msg},
+                )
+                self._active_turn_id = None
+                self._cancel_active = False
+                await self._emit_translated(synth)
         self.turn_active = False
 
 

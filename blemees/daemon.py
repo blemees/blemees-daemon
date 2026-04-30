@@ -348,6 +348,7 @@ class Connection:
                 session_id=msg.session_id,
                 argv=argv,
                 cwd=msg.options.get("cwd"),
+                options=msg.options,
                 on_event=on_event,
                 logger=self._log,
                 stderr_rate_lines=self._config.stderr_rate_lines,

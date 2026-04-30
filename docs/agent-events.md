@@ -47,7 +47,7 @@ either appear with a value or are omitted entirely.
 | `agent.tool_use` | A tool invocation request emitted by the model. | `tool_use_id, name, input` |
 | `agent.tool_result` | The result the backend received for a tool invocation. | `tool_use_id, output, is_error?` |
 | `agent.notice` | Backend-side informational events that are neither output nor errors — `mcp_startup_*` from codex, rate-limit pings, etc. Clients may ignore. | `level: "info" \| "warn", category: string, text?, data?` |
-| `agent.result` | Turn-end. Always the last frame for a turn. The daemon uses this to mark `turn_active=False`. | `subtype: "success" \| "error" \| "interrupted" \| ..., duration_ms?, num_turns?, turn_id?, usage?: NormalisedUsage` |
+| `agent.result` | Turn-end. Always the last frame for a turn (including on crash, auth failure, or interrupt — the daemon synthesises one when the backend doesn't). The daemon uses this to mark `turn_active=False`. | `subtype: "success" \| "error" \| "interrupted" \| ..., duration_ms?, num_turns?, turn_id?, time_to_first_token_ms?, usage?: NormalisedUsage, error?` |
 
 `NormalisedUsage`:
 
@@ -66,11 +66,57 @@ through (existing CC behaviour). `reasoning_output_tokens` is **not**
 folded into `output_tokens`: surfacing them separately matches what
 Codex actually meters and lets clients budget independently.
 
+## Symmetry guarantees
+
+Beyond verbatim translation, the daemon also synthesises frames so the
+two backends present a uniform turn lifecycle. Clients can rely on the
+following invariants regardless of backend:
+
+- **Every turn closes with `agent.result`.** If the backend never emits
+  one (crash mid-turn, auth failure, hard interrupt), the daemon
+  synthesises a closing `agent.result` with the appropriate `subtype`
+  (`error` or `interrupted`) and an `error: {code, message}` block.
+  Codes used in synth results: `backend_crashed`, `auth_failed`. The
+  `blemeesd.error` frame is *also* emitted for visibility — clients
+  that wait on `agent.result` to detect turn end will not hang.
+
+- **Every turn opens with `agent.notice{category:"task_started"}`.**
+  Codex emits this natively from `task_started`; the Claude backend
+  synthesises one when it writes the user turn to stdin. Carries
+  `data: {turn_id, started_at_ms}`. Clients can use it for
+  "model is thinking…" UI hooks on both backends.
+
+- **`agent.result.turn_id` is always set.** Codex carries it from
+  `task_complete`; for Claude the daemon allocates a per-turn UUID hex
+  in `send_user_turn` and stamps it on the eventual `agent.result`
+  (including all synth variants). The same id appears in the
+  preceding `task_started` notice so clients can correlate.
+
+- **`agent.result.time_to_first_token_ms` is always set when there
+  was a first token.** Codex's value comes from `task_complete`
+  (model-side measurement). The Claude value is daemon-side wall-clock
+  from the `send_user_turn` write to the first `agent.delta`. The two
+  are not directly comparable but both bound a useful "time to first
+  token" envelope.
+
+- **`agent.system_init.capabilities` is populated for both backends.**
+  Codex pulls from `session_configured`. Claude synthesises from
+  `options.claude.*`: `permission_mode` (verbatim),
+  `reasoning_effort` (renamed from `effort` to match Codex's name),
+  `rollout_path` (the `~/.claude/projects/<cwd>/<session>.jsonl`
+  path).
+
+For the residual asymmetries the daemon does **not** try to paper
+over — reasoning/thinking deltas, MCP startup chatter, the
+codex-side tool-use coverage gap, and Claude's tool-result-block
+splitting — see [`docs/asymmetries.md`](asymmetries.md).
+
 ## Translation: Claude Code → `agent.*`
 
 | CC native event | `agent.*` translation | Notes |
 |---|---|---|
-| `system{subtype:"init"}` | `agent.system_init{model, cwd, tools, native_session_id: <CC session-id>}` | One frame per spawn. Pass `tools` array through verbatim. |
+| (synth, daemon-side, on `send_user_turn`) | `agent.notice{category:"task_started", data:{turn_id, started_at_ms}}` | Synthesised so Claude has a turn-start hook parallel to Codex's native `task_started`. `turn_id` is a per-turn UUID hex; reused on the closing `agent.result`. |
+| `system{subtype:"init"}` | `agent.system_init{model, cwd, tools, native_session_id: <CC session-id>, capabilities: {permission_mode?, reasoning_effort?, rollout_path}}` | One frame per spawn. Pass `tools` array through verbatim. `capabilities` is daemon-synthesised from `options.claude.*` so the shape parallels Codex's. |
 | `system{subtype:"<other>"}` | `agent.notice{category:"system_<subtype>", data:<rest>}` | Forward-compat for future CC system frames. |
 | `stream_event{message_start}` | dropped (folded into `agent.system_init` if not yet emitted) | |
 | `stream_event{content_block_start{type:"text"}}` | dropped | Block boundary; deltas alone carry the content. |
@@ -86,7 +132,9 @@ Codex actually meters and lets clients budget independently.
 | `partial_assistant{message}` | dropped (only `--include-partial-messages` produces these; redundant once we emit deltas) | |
 | `user{message: {content: string \| [text-only]}}` | `agent.user_echo{message}` | |
 | `user{message: {content: [..., {type:"tool_result", tool_use_id, content, is_error}, ...]}}` | one `agent.tool_result{tool_use_id, output:content, is_error}` per `tool_result` block; remaining text blocks emit a single `agent.user_echo`. | |
-| `result{subtype, duration_ms, num_turns, usage}` | `agent.result{subtype, duration_ms, num_turns, usage: <pass-through>}` | |
+| `result{subtype, duration_ms, num_turns, usage}` | `agent.result{subtype, duration_ms, num_turns, turn_id, time_to_first_token_ms?, usage: <pass-through>}` | `turn_id` is the per-turn UUID hex; `time_to_first_token_ms` is daemon-side wall-clock from `send_user_turn` to the first `agent.delta`. Both daemon-synthesised. |
+| (synth, daemon-side; CC subprocess crashed mid-turn) | `agent.result{subtype:"error", num_turns:1, turn_id, time_to_first_token_ms?, error:{code:"backend_crashed", message}}` | Emitted alongside `blemeesd.error{backend_crashed}` so clients waiting on `agent.result` see a clean turn close (spec §5.6 invariant). |
+| (synth, daemon-side; CC stderr matched auth-failure pattern mid-turn) | `agent.result{subtype:"error", num_turns:1, turn_id, time_to_first_token_ms?, error:{code:"auth_failed", message}}` | Emitted alongside `blemeesd.error{auth_failed}`. |
 
 ## Translation: Codex MCP → `agent.*`
 
@@ -118,8 +166,9 @@ originating `tools/call`, plus the preceding `task_complete` and last
 | `exec_command_begin` (and family) | `agent.tool_use{tool_use_id: msg.call_id, name:"shell" \| msg.tool, input: msg.command \| msg.params}` | *Not observed in the captured trace; mapping locked from Codex source. Re-trace with a tool-using prompt before Phase 3 implementation.* |
 | `exec_command_end` (and family) | `agent.tool_result{tool_use_id, output, is_error}` | Same caveat. |
 | `task_complete{turn_id, duration_ms, time_to_first_token_ms, last_agent_message}` | folded into the synthesised `agent.result` | |
-| JSON-RPC `result{content, structuredContent:{threadId, content}}` | terminal `agent.result{subtype:"success", duration_ms, num_turns:1, turn_id, usage}` | Errors surface as `subtype:"error"` with the JSON-RPC error data on `agent.result.error`. |
+| JSON-RPC `result{content, structuredContent:{threadId, content}}` | terminal `agent.result{subtype:"success", duration_ms, num_turns:1, turn_id, time_to_first_token_ms?, usage}` | Errors surface as `subtype:"error"` with the JSON-RPC error data on `agent.result.error`. |
 | Cancelled turn (we sent `notifications/cancelled`) | `agent.result{subtype:"interrupted"}` | |
+| (synth, daemon-side; codex subprocess crashed mid-turn) | `agent.result{subtype:"error", num_turns:1, turn_id?, time_to_first_token_ms?, error:{code:"backend_crashed", message}}` | Emitted alongside `blemeesd.error{backend_crashed}` so clients waiting on `agent.result` see a clean turn close. Mirrors the Claude path. |
 
 ## Inbound: user turns
 

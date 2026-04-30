@@ -122,6 +122,7 @@
           "duration_ms": { "type": "integer", "minimum": 0 },
           "num_turns": { "type": "integer", "minimum": 0 },
           "turn_id": { "type": "string" },
+          "time_to_first_token_ms": { "type": "integer", "minimum": 0 },
           "usage": { "$ref": "https://blemees/schemas/_common.json#/$defs/NormalisedUsage" },
           "error": {
             "type": "object",

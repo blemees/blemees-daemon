@@ -11,6 +11,9 @@ environment variable before spawning. Modes:
 * ``slow``      → each stdin line starts generating; emit one text delta
   every 100 ms until SIGTERM arrives; then exit 0 (simulates an interrupt).
 * ``oauth``     → emit an OAuth-style error to stderr, exit 1.
+* ``oauth_midturn`` → consume a stdin line, write a single delta, then
+  emit an OAuth-style error on stderr and exit 1. Exercises the
+  daemon's mid-turn auth-failure synth path.
 * ``echo``      → echo whatever text is in the inbound message.
 
 The fake records its argv to ``$BLEMEES_FAKE_ARGV_FILE`` (one JSON line) so
@@ -99,6 +102,22 @@ def main() -> int:
 
     for user in _read_user_lines():
         text = _content_text(user)
+
+        if mode == "oauth_midturn":
+            # Emit one delta so the daemon flips into "turn in flight",
+            # then surface an auth pattern on stderr and exit non-zero.
+            _emit(
+                {
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_delta",
+                        "delta": {"type": "text_delta", "text": "."},
+                    },
+                }
+            )
+            sys.stderr.write("Error 401: OAuth token expired\n")
+            sys.stderr.flush()
+            return 1
 
         if mode == "crash":
             _emit({"type": "stream_event", "event": {"type": "content_block_start"}})

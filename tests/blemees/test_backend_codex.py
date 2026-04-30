@@ -237,6 +237,9 @@ async def test_auth_error_emits_auth_failed(monkeypatch):
 
 
 async def test_crash_surfaces_backend_crashed(monkeypatch):
+    """Crash mid-turn surfaces both `blemeesd.error{backend_crashed}` and
+    a synthesised closing `agent.result{subtype:"error"}` so the turn
+    invariant from spec §5.6 holds (mirrors the Claude backend)."""
     monkeypatch.setenv("BLEMEES_FAKE_MODE", "crash")
     queue: asyncio.Queue = asyncio.Queue()
     proc = _make_backend(queue)
@@ -244,12 +247,18 @@ async def test_crash_surfaces_backend_crashed(monkeypatch):
     try:
         await proc.send_user_turn({"role": "user", "content": "boom"})
         saw_error = False
-        for _ in range(20):
+        saw_synth_result = False
+        for _ in range(40):
             evt = await asyncio.wait_for(queue.get(), timeout=5.0)
             if evt.get("type") == "blemeesd.error" and evt.get("code") == "backend_crashed":
                 saw_error = True
+            if evt.get("type") == "agent.result" and evt.get("subtype") == "error":
+                saw_synth_result = True
+                assert evt["error"]["code"] == "backend_crashed"
+                assert "stderr tail" in evt["error"]["message"]
                 break
         assert saw_error, "never saw backend_crashed"
+        assert saw_synth_result, "never saw synth agent.result{error}"
     finally:
         await proc.close()
 
