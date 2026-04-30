@@ -121,6 +121,13 @@ following invariants regardless of backend:
   on resume (cached `threadId`) and on the `system_init` after the
   first turn's `session_configured`.
 
+- **`agent.message.phase` carries the same semantic on both
+  backends.** Codex emits `phase:"final_answer"` from
+  `item_completed{AgentMessage}`. Claude derives the same value
+  from CC's `assistant` event when the content has no `tool_use`
+  blocks; mid-turn messages (those calling a tool) omit `phase`
+  rather than mislabel them.
+
 For the residual asymmetries the daemon does **not** try to paper
 over — reasoning/thinking deltas, MCP startup chatter, the
 codex-side tool-use coverage gap, and Claude's tool-result-block
@@ -143,7 +150,7 @@ splitting — see [`docs/asymmetries.md`](asymmetries.md).
 | `stream_event{content_block_stop}` | dropped | |
 | `stream_event{message_delta{usage}}` | dropped | Final usage arrives on `result`. |
 | `stream_event{message_stop}` | dropped | |
-| `assistant{message}` | `agent.message{role:"assistant", content: message.content}` | |
+| `assistant{message}` | `agent.message{role:"assistant", content: message.content, phase?:"final_answer"}` | `phase:"final_answer"` is daemon-derived to match codex's `AgentMessage.phase`: a message with no `tool_use` content blocks is the final answer to the user. Messages that *do* contain `tool_use` blocks are mid-turn (model is calling a tool) — `phase` is omitted there rather than mislabelled. |
 | `partial_assistant{message}` | dropped (only `--include-partial-messages` produces these; redundant once we emit deltas) | |
 | `user{message: {content: string \| [text-only]}}` | `agent.user_echo{message}` | Only when `options.claude.user_echo:true` (passes `--replay-user-messages` to CC). Off by default. |
 | `user{message: {content: [..., {type:"tool_result", tool_use_id, content, is_error}, ...]}}` | one `agent.tool_result{tool_use_id, output:content, is_error}` per `tool_result` block; remaining text blocks emit a single `agent.user_echo`. | Tool-result fan-out happens regardless of `user_echo`; the surrounding text echo follows the same toggle as the row above. |

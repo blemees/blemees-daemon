@@ -196,6 +196,16 @@ def _translate_assistant(event: dict[str, Any], raw: dict[str, Any] | None) -> l
         "role": "assistant",
         "content": content,
     }
+    # Derive `phase` to match codex's `AgentMessage.phase` field.
+    # Codex tags user-facing replies as `phase:"final_answer"`; for
+    # claude we infer the same: a message with no `tool_use` blocks
+    # is the final answer to the user (the model has nothing more
+    # to do this turn). Messages that *do* contain `tool_use` blocks
+    # are mid-turn (the model is calling a tool), so we omit `phase`
+    # rather than mislabel them.
+    has_tool_use = any(isinstance(b, dict) and b.get("type") == "tool_use" for b in content)
+    if not has_tool_use:
+        frame["phase"] = "final_answer"
     if raw is not None:
         frame["raw"] = raw
     return [frame]

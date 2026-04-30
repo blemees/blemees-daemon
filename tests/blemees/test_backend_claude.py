@@ -73,6 +73,61 @@ def test_rate_limit_event_carries_raw_when_requested():
     assert out[0]["raw"] == {"type": "rate_limit_event", "x": 1}
 
 
+def test_assistant_no_tool_use_gets_final_answer_phase():
+    """Claude's assistant message with text-only content lands as
+    `agent.message{phase:"final_answer"}` to match codex's
+    AgentMessage.phase semantic ("this is the user-facing reply")."""
+    out = translate_event(
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "pong"}],
+            },
+        }
+    )
+    assert len(out) == 1
+    msg = out[0]
+    assert msg["type"] == "agent.message"
+    assert msg["phase"] == "final_answer"
+
+
+def test_assistant_with_tool_use_omits_phase():
+    """Mid-turn assistant messages (those calling a tool) get no
+    `phase` field — they're not the final answer, so we don't
+    mislabel them as one."""
+    out = translate_event(
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Let me check…"},
+                    {"type": "tool_use", "id": "t1", "name": "Read", "input": {}},
+                ],
+            },
+        }
+    )
+    msg = out[0]
+    assert msg["type"] == "agent.message"
+    assert "phase" not in msg
+
+
+def test_assistant_with_thinking_only_gets_final_answer_phase():
+    """Thinking-only blocks are still 'final answer' as far as the
+    turn is concerned — no tool calls left to make."""
+    out = translate_event(
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "thinking", "thinking": "hmm"}],
+            },
+        }
+    )
+    assert out[0]["phase"] == "final_answer"
+
+
 # ---------------------------------------------------------------------------
 # argv_to_resume
 # ---------------------------------------------------------------------------

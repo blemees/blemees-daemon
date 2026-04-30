@@ -78,7 +78,7 @@
       "status": "allowed"
     },
     "session_id": "<session_id>",
-    "uuid": "837e6952-9657-4c3a-b2df-6bb2e80ab117"
+    "uuid": "e5801c95-7a66-43cc-a096-7958629c16c5"
   },
   "level": "info",
   "session_id": "<session_id>",
@@ -92,6 +92,7 @@
       "type": "text"
     }
   ],
+  "phase": "final_answer",
   "role": "assistant",
   "session_id": "<session_id>",
   "type": "agent.message"
