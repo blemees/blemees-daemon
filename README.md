@@ -478,15 +478,19 @@ Daemon reply on success:
   "session_id":"s_abc",
   "backend":"claude",
   "subprocess_pid":54321,
-  "native_session_id":"s_abc",
   "last_seq":0
 }
 ```
 
-`native_session_id` is the backend's own session identifier — equal to
-`session_id` for the Claude backend (CC's `--session-id`), and the
-Codex `threadId` for the Codex backend. Clients usually don't need it
-but it appears in transcripts and logs.
+`native_session_id` is the backend's own session identifier — present
+**only when it differs from `session_id`**. Absence is the wire-level
+signal "the daemon's session id is also the backend's id, use it
+directly". For Claude this field is always omitted (CC's
+`--session-id` accepts the daemon's value verbatim). For Codex it's
+the `threadId` — omitted on a fresh open (unknown until the first
+`session_configured` event), present on resume and after the first
+turn. Clients usually don't need it but it appears in transcripts
+and logs.
 
 On failure:
 ```json

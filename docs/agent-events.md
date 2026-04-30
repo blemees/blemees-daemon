@@ -40,7 +40,7 @@ either appear with a value or are omitted entirely.
 
 | Type | Purpose | Payload (besides common fields) |
 |---|---|---|
-| `agent.system_init` | First frame after spawn. Tells the client which backend, model, cwd, tools, and native session id are in play. | `model?, cwd?, tools?, native_session_id?, capabilities?, context_window?` |
+| `agent.system_init` | First frame after spawn. Tells the client which backend, model, cwd, tools, and (for backends whose internal id differs from `session_id`) `native_session_id` are in play. The `native_session_id` field is present **only when it differs from `session_id`** — absent on Claude (CC's `--session-id` accepts our value verbatim), present on Codex (the `threadId`). | `model?, cwd?, tools?, native_session_id?, capabilities?, context_window?` |
 | `agent.delta` | Incremental output during a turn. | `kind: "text" \| "thinking" \| "tool_input"`, plus one of: `text` (text/thinking) or `partial_json` (tool_input). May carry `item_id?` (Codex) or `index?` (CC content-block index) for clients that want to reassemble. |
 | `agent.message` | A complete message from the assistant role (post-stream). | `role: "assistant", content: [...], phase?` |
 | `agent.user_echo` | Echo of the user's input message. **Off by default on both backends** — opt in via `options.<backend>.user_echo: true`. (Claude additionally emits user-frame fan-outs for tool-result-bearing `user` events regardless of the toggle — see the translation table below.) | `message: { role:"user", content:... }` |
@@ -108,6 +108,15 @@ following invariants regardless of backend:
   `rollout_path` (the `~/.claude/projects/<cwd>/<session>.jsonl`
   path).
 
+- **`native_session_id` is present iff it differs from `session_id`.**
+  On both `blemeesd.opened` and `agent.system_init` the field is
+  emitted only when the backend's internal id differs from the
+  daemon's. Absence is the canonical signal "use `session_id`
+  directly". For Claude this means it's never present (CC's
+  `--session-id` accepts our UUID verbatim). For Codex it shows up
+  on resume (cached `threadId`) and on the `system_init` after the
+  first turn's `session_configured`.
+
 For the residual asymmetries the daemon does **not** try to paper
 over — reasoning/thinking deltas, MCP startup chatter, the
 codex-side tool-use coverage gap, and Claude's tool-result-block
@@ -118,7 +127,7 @@ splitting — see [`docs/asymmetries.md`](asymmetries.md).
 | CC native event | `agent.*` translation | Notes |
 |---|---|---|
 | (synth, daemon-side, on `send_user_turn`) | `agent.notice{category:"task_started", data:{turn_id, started_at_ms}}` | Synthesised so Claude has a turn-start hook parallel to Codex's native `task_started`. `turn_id` is a per-turn UUID hex; reused on the closing `agent.result`. |
-| `system{subtype:"init"}` | `agent.system_init{model, cwd, tools, native_session_id: <CC session-id>, capabilities: {permission_mode?, reasoning_effort?, rollout_path}}` | One frame per spawn. Pass `tools` array through verbatim. `capabilities` is daemon-synthesised from `options.claude.*` so the shape parallels Codex's. |
+| `system{subtype:"init"}` | `agent.system_init{model, cwd, tools, capabilities: {permission_mode?, reasoning_effort?, rollout_path}}` | One frame per spawn. Pass `tools` array through verbatim. `capabilities` is daemon-synthesised from `options.claude.*` so the shape parallels Codex's. `native_session_id` is **deliberately omitted** for Claude — it would always equal `session_id`; absence is the wire-level "use session_id directly" signal. |
 | `system{subtype:"<other>"}` | `agent.notice{category:"system_<subtype>", data:<rest>}` | Forward-compat for future CC system frames. |
 | `stream_event{message_start}` | dropped (folded into `agent.system_init` if not yet emitted) | |
 | `stream_event{content_block_start{type:"text"}}` | dropped | Block boundary; deltas alone carry the content. |

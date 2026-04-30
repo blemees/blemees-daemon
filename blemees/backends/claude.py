@@ -346,10 +346,12 @@ class ClaudeBackend:
                 frame["backend"] = self.backend
                 ftype = frame.get("type")
                 if ftype == "agent.system_init":
-                    if "native_session_id" not in frame:
-                        # CC's wire doesn't carry `native_session_id`; it's
-                        # the same as our session id (passed via `--session-id`).
-                        frame["native_session_id"] = self.session_id
+                    # We deliberately do *not* inject `native_session_id`
+                    # for Claude — it would always equal `session_id`
+                    # (CC's `--session-id` accepts our value verbatim).
+                    # Absence is the wire-level signal "use session_id
+                    # directly"; presence is reserved for backends like
+                    # Codex whose internal id genuinely differs.
                     self._inject_capabilities(frame)
                 elif self._first_token_at_ms is None and ftype in _FIRST_CONTENT_TYPES:
                     # First content frame of the turn — record for TTFT

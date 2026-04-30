@@ -422,11 +422,16 @@ class Connection:
         self._owned_sessions.add(msg.session_id)
 
         # Send ack before the event stream so clients can match the reply
-        # before they start consuming (possibly replayed) frames. For
-        # Claude the native id always equals our session id; for Codex we
-        # only emit ``native_session_id`` once it's been observed (omit
-        # on a fresh open — the schema permits absence on the first
-        # opened frame).
+        # before they start consuming (possibly replayed) frames.
+        #
+        # ``native_session_id`` is present *only when it differs from*
+        # ``session_id`` — its absence is the signal "the daemon's
+        # session id is also the backend's id, use it directly". For
+        # Claude the two are always equal (CC's ``--session-id``
+        # accepts our value verbatim) so we never emit it. For Codex
+        # we emit it once the threadId has been observed (after the
+        # first turn produces ``session_configured``, or on resume
+        # where the threadId is cached on the Session).
         opened_frame: dict[str, Any] = {
             "type": "blemeesd.opened",
             "id": msg.id,
@@ -435,9 +440,7 @@ class Connection:
             "subprocess_pid": sess.backend.pid,
             "last_seq": sess.seq,
         }
-        if msg.backend == "claude":
-            opened_frame["native_session_id"] = msg.session_id
-        elif sess.native_session_id:
+        if sess.native_session_id and sess.native_session_id != msg.session_id:
             opened_frame["native_session_id"] = sess.native_session_id
         await self._emit_frame(opened_frame)
 

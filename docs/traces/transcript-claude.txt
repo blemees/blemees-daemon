@@ -17,7 +17,6 @@
 {
   "id": "<req_id>",
   "last_seq": 0,
-  "native_session_id": "<native_session_id_1>",
   "session_id": "<session_id>",
   "subprocess_pid": "<pid>",
   "type": "blemeesd.opened"
@@ -30,7 +29,6 @@
   },
   "cwd": "<cwd>",
   "model": "<model>",
-  "native_session_id": "<native_session_id_1>",
   "session_id": "<session_id>",
   "tools": [
     "mcp__claude_ai_Asana__authenticate",
@@ -80,7 +78,7 @@
       "status": "allowed"
     },
     "session_id": "<session_id>",
-    "uuid": "bd1900e2-509d-460c-b082-376a0353792f"
+    "uuid": "d2645cd7-a693-4bf5-a861-4444d5548086"
   },
   "level": "info",
   "session_id": "<session_id>",
