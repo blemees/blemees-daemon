@@ -92,12 +92,14 @@ following invariants regardless of backend:
   (including all synth variants). The same id appears in the
   preceding `task_started` notice so clients can correlate.
 
-- **`agent.result.time_to_first_token_ms` is always set when there
-  was a first token.** Codex's value comes from `task_complete`
-  (model-side measurement). The Claude value is daemon-side wall-clock
-  from the `send_user_turn` write to the first `agent.delta`. The two
-  are not directly comparable but both bound a useful "time to first
-  token" envelope.
+- **`agent.result.time_to_first_token_ms` is always set when the
+  turn produced any model output.** Codex's value comes from
+  `task_complete` (model-side measurement). The Claude value is
+  daemon-side wall-clock from the `send_user_turn` write to the
+  first model-output frame — `agent.delta` (long replies) or
+  `agent.message` / `agent.tool_use` (short replies CC didn't chunk
+  into deltas). The two measurements aren't directly comparable but
+  both bound the same first-output latency envelope.
 
 - **`agent.system_init.capabilities` is populated for both backends.**
   Codex pulls from `session_configured`. Claude synthesises from
@@ -132,7 +134,7 @@ splitting — see [`docs/asymmetries.md`](asymmetries.md).
 | `partial_assistant{message}` | dropped (only `--include-partial-messages` produces these; redundant once we emit deltas) | |
 | `user{message: {content: string \| [text-only]}}` | `agent.user_echo{message}` | Only when `options.claude.user_echo:true` (passes `--replay-user-messages` to CC). Off by default. |
 | `user{message: {content: [..., {type:"tool_result", tool_use_id, content, is_error}, ...]}}` | one `agent.tool_result{tool_use_id, output:content, is_error}` per `tool_result` block; remaining text blocks emit a single `agent.user_echo`. | Tool-result fan-out happens regardless of `user_echo`; the surrounding text echo follows the same toggle as the row above. |
-| `result{subtype, duration_ms, num_turns, usage}` | `agent.result{subtype, duration_ms, num_turns, turn_id, time_to_first_token_ms?, usage: <pass-through>}` | `turn_id` is the per-turn UUID hex; `time_to_first_token_ms` is daemon-side wall-clock from `send_user_turn` to the first `agent.delta`. Both daemon-synthesised. |
+| `result{subtype, duration_ms, num_turns, usage}` | `agent.result{subtype, duration_ms, num_turns, turn_id, time_to_first_token_ms?, usage: <pass-through>}` | `turn_id` is the per-turn UUID hex; `time_to_first_token_ms` is daemon-side wall-clock from `send_user_turn` to the first model-output frame (`agent.delta` for long replies, `agent.message` / `agent.tool_use` for short replies CC didn't chunk). Both daemon-synthesised. |
 | (synth, daemon-side; CC subprocess crashed mid-turn) | `agent.result{subtype:"error", num_turns:1, turn_id, time_to_first_token_ms?, error:{code:"backend_crashed", message}}` | Emitted alongside `blemeesd.error{backend_crashed}` so clients waiting on `agent.result` see a clean turn close (spec §5.6 invariant). |
 | (synth, daemon-side; CC stderr matched auth-failure pattern mid-turn) | `agent.result{subtype:"error", num_turns:1, turn_id, time_to_first_token_ms?, error:{code:"auth_failed", message}}` | Emitted alongside `blemeesd.error{auth_failed}`. |
 

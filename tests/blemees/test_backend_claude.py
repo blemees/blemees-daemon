@@ -163,6 +163,39 @@ async def test_normal_turn_produces_result(monkeypatch):
         await proc.close()
 
 
+async def test_time_to_first_token_ms_present_for_short_reply(monkeypatch):
+    """CC suppresses content_block_delta events for short replies (the
+    final `assistant` message is the first model output we see). The
+    daemon's TTFT measurement falls back to `agent.message` /
+    `agent.tool_use`, so the metric is always present on the closing
+    `agent.result` regardless of reply length."""
+    monkeypatch.setenv("BLEMEES_FAKE_MODE", "short")
+    queue: asyncio.Queue = asyncio.Queue()
+    logger = configure("error")
+    proc = ClaudeBackend(
+        session_id="s1",
+        argv=_make_argv("s1"),
+        cwd=None,
+        on_event=queue.put,
+        logger=logger,
+    )
+    await proc.spawn()
+    try:
+        await proc.send_user_turn({"role": "user", "content": "hi"})
+        events = await _drain_until_result(queue, "s1")
+        kinds = [e["type"] for e in events]
+        # No deltas at all for a "short" reply.
+        assert "agent.delta" not in kinds
+        # ... but agent.message did arrive, and TTFT was measured to it.
+        assert "agent.message" in kinds
+        result = events[-1]
+        assert result["type"] == "agent.result"
+        assert isinstance(result.get("time_to_first_token_ms"), int)
+        assert result["time_to_first_token_ms"] >= 0
+    finally:
+        await proc.close()
+
+
 async def test_send_user_turn_emits_task_started_notice(monkeypatch):
     """The daemon synthesises `agent.notice{category:"task_started"}` so
     Claude has the same turn-start hook codex emits natively."""

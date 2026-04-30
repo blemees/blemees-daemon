@@ -14,6 +14,10 @@ environment variable before spawning. Modes:
 * ``oauth_midturn`` → consume a stdin line, write a single delta, then
   emit an OAuth-style error on stderr and exit 1. Exercises the
   daemon's mid-turn auth-failure synth path.
+* ``short``     → emit ``assistant`` and ``result`` directly with no
+  intervening ``stream_event{content_block_delta}``. Mirrors what
+  CC actually does for very short replies (it skips chunking).
+  Exercises the daemon's fallback TTFT measurement path.
 * ``echo``      → echo whatever text is in the inbound message.
 
 The fake records its argv to ``$BLEMEES_FAKE_ARGV_FILE`` (one JSON line) so
@@ -143,6 +147,36 @@ def main() -> int:
                 return 0
             except BrokenPipeError:
                 return 0
+
+        if mode == "short":
+            # No content_block_delta — just the final assistant message
+            # and result. Mirrors real CC behaviour for short replies
+            # without --include-partial-messages.
+            reply = "pong"
+            _emit(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": reply}],
+                    },
+                }
+            )
+            _emit(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "duration_ms": 1,
+                    "num_turns": 1,
+                    "usage": {
+                        "input_tokens": 5,
+                        "output_tokens": 1,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                }
+            )
+            continue
 
         if mode == "finish":
             # Streams a delta, waits a configurable window, then emits a

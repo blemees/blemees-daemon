@@ -49,6 +49,14 @@ _AUTH_FAIL_PATTERNS: tuple[str, ...] = (
     "Session authentication failed",
 )
 
+# Frame types that count as "first content from the model" for TTFT
+# measurement. Excludes `agent.system_init` (session boot, not turn
+# output), `agent.notice` (informational), `agent.user_echo` (input
+# echo), and `agent.tool_result` (external feedback into the model,
+# not the model's own output). See `_first_token_at_ms` use in
+# `_read_stdout`.
+_FIRST_CONTENT_TYPES: frozenset[str] = frozenset({"agent.delta", "agent.message", "agent.tool_use"})
+
 
 class _StderrRateLimiter:
     """Rolling-window line limiter. Spec §5.6."""
@@ -343,8 +351,16 @@ class ClaudeBackend:
                         # the same as our session id (passed via `--session-id`).
                         frame["native_session_id"] = self.session_id
                     self._inject_capabilities(frame)
-                elif ftype == "agent.delta" and self._first_token_at_ms is None:
-                    # First delta of the turn — record for TTFT measurement.
+                elif self._first_token_at_ms is None and ftype in _FIRST_CONTENT_TYPES:
+                    # First content frame of the turn — record for TTFT
+                    # measurement. Includes `agent.message` and
+                    # `agent.tool_use` because CC suppresses
+                    # `stream_event{content_block_delta}` for short replies
+                    # without `--include-partial-messages`, so we never see
+                    # an `agent.delta` for terse turns. The metric becomes
+                    # "time to first model output frame" rather than
+                    # strictly "time to first text token", but both bound
+                    # the same first-output latency envelope.
                     self._first_token_at_ms = int(time.time() * 1000)
                 if ftype in TURN_END_TYPES:
                     self._stamp_turn_metadata(frame)

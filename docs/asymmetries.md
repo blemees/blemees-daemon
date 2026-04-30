@@ -163,21 +163,31 @@ a single `assistant{message}` with no preceding deltas at all.
 `agent_message_content_delta` regardless of length, so
 `agent.delta{kind:"text"}` always appears on Codex.
 
-**Side effect:** Claude's `time_to_first_token_ms` (daemon-measured)
-is *omitted* on these short turns because we never see a first delta
-to clock against. The redacted transcripts show `agent.result`
-without that field on Claude but with it on Codex.
+**Why we left it alone:** this is upstream CC behaviour. Setting
+`include_partial_messages: true` on the open options forces
+deltas, but that's a client choice — forcing it daemon-side would
+also surface `partial_assistant` events the translator currently
+drops, changing other shape.
 
-**Why we left it alone:** this is upstream behaviour. Setting
-`include_partial_messages: true` on the open options would force
-deltas to appear, but that's a client choice — forcing it daemon-side
-would change other shape (we'd start surfacing `partial_assistant`
-events the translator currently drops).
+### Side effect on TTFT — *resolved*
 
-**Future option:** if the missing TTFT bothers a client, we could
-fall back to measuring TTFT from the `assistant` event (first complete
-message). It's a coarser metric — "time to whole reply" vs "time to
-first token" — but at least the field is always populated.
+Originally `time_to_first_token_ms` was omitted from
+`agent.result` on these short turns because the daemon's clock-to-
+first-`agent.delta` measurement never ticked. Resolved by widening
+the trigger to **first model-output frame of any kind**
+(`agent.delta`, `agent.message`, or `agent.tool_use` — see
+`_FIRST_CONTENT_TYPES` in `blemees/backends/claude.py`). The metric
+is now always present on Claude `agent.result` frames whenever the
+turn produced any model output. Pinned by
+`test_time_to_first_token_ms_present_for_short_reply`.
+
+The semantics shift slightly: on Claude, "time to first token"
+becomes "time to first model-output frame". For long replies this
+is still the first text delta (delta arrives before message); for
+short replies it falls back to the complete `assistant` message.
+Codex's value comes from `task_complete.time_to_first_token_ms`
+(model-side measurement, always present). The two are not directly
+comparable but both bound the same first-output latency envelope.
 
 ---
 

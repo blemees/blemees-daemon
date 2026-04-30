@@ -80,7 +80,7 @@
       "status": "allowed"
     },
     "session_id": "<session_id>",
-    "uuid": "1aa0027b-0ee8-4493-9668-54ce643f89cc"
+    "uuid": "bd1900e2-509d-460c-b082-376a0353792f"
   },
   "level": "info",
   "session_id": "<session_id>",
@@ -104,6 +104,7 @@
   "num_turns": 1,
   "session_id": "<session_id>",
   "subtype": "success",
+  "time_to_first_token_ms": "<ms>",
   "turn_id": "<turn_id_1>",
   "type": "agent.result",
   "usage": {
