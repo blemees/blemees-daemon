@@ -70,12 +70,24 @@ def translate_event(event: dict[str, Any], *, include_raw: bool = False) -> list
 # ---------------------------------------------------------------------------
 
 
+def _claude_context_window(model: str) -> int:
+    # Claude Code's `system.init` doesn't carry a context_window field, but
+    # the TUI needs one to render the `ctx N%` chip. Infer from the model
+    # name: the 1M variants (`-1m` suffix or `[1m]` modifier) get 1_000_000;
+    # everything else falls back to Anthropic's 200k default.
+    lowered = model.lower()
+    if "1m" in lowered and ("[1m]" in lowered or lowered.endswith("-1m") or "-1m-" in lowered):
+        return 1_000_000
+    return 200_000
+
+
 def _translate_system(event: dict[str, Any], raw: dict[str, Any] | None) -> list[dict[str, Any]]:
     subtype = event.get("subtype")
     if subtype == "init":
         out: dict[str, Any] = {"type": "agent.system_init"}
         if isinstance(event.get("model"), str):
             out["model"] = event["model"]
+            out["context_window"] = _claude_context_window(event["model"])
         if isinstance(event.get("cwd"), str):
             out["cwd"] = event["cwd"]
         if isinstance(event.get("tools"), list):

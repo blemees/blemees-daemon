@@ -38,7 +38,7 @@ from ..errors import (
     SessionBusyError,
     SpawnFailedError,
 )
-from . import EventCallback
+from . import EventCallback, build_spawn_env
 from .translate_codex import CodexTranslator
 
 # JSON-RPC handshake constants. `protocolVersion` matches what the
@@ -156,11 +156,13 @@ class CodexBackend:
         stderr_rate_window_s: float = 10.0,
         include_raw_events: bool = False,
         thread_id: str | None = None,
+        alias: str | None = None,
     ) -> None:
         self.session_id = session_id
         self._argv = argv
         self._cwd = cwd
         self._options = options
+        self._alias = alias or None
         self._on_event = on_event
         self._log = logger.bind(session_id=session_id, backend=self.backend)
         self._stderr_limit = _StderrRateLimiter(stderr_rate_lines, stderr_rate_window_s)
@@ -227,6 +229,7 @@ class CodexBackend:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self._cwd,
+                env=build_spawn_env(self.session_id, self._cwd, self._alias),
             )
         except (FileNotFoundError, PermissionError, OSError) as exc:
             raise SpawnFailedError(f"failed to launch codex: {exc}") from exc

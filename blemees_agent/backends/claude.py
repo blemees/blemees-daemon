@@ -38,7 +38,7 @@ from ..errors import (
     SpawnFailedError,
     UnsafeFlagError,
 )
-from . import EventCallback
+from . import EventCallback, build_spawn_env
 from .translate_claude import TURN_END_TYPES, translate_event
 
 # Signatures that indicate the CLI's OAuth token has expired. Spec §9.2.
@@ -96,11 +96,13 @@ class ClaudeBackend:
         stderr_rate_lines: int = 50,
         stderr_rate_window_s: float = 10.0,
         include_raw_events: bool = False,
+        alias: str | None = None,
     ) -> None:
         self.session_id = session_id
         self._argv = argv
         self._cwd = cwd
         self._options = options or {}
+        self._alias = alias or None
         self._on_event = on_event
         self._log = logger.bind(session_id=session_id, backend=self.backend)
         self._stderr_limit = _StderrRateLimiter(stderr_rate_lines, stderr_rate_window_s)
@@ -154,6 +156,7 @@ class ClaudeBackend:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self._cwd,
+                env=build_spawn_env(self.session_id, self._cwd, self._alias),
             )
         except (FileNotFoundError, PermissionError, OSError) as exc:
             raise SpawnFailedError(f"failed to launch claude: {exc}") from exc

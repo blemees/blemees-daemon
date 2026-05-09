@@ -30,6 +30,7 @@ Phase 1 ships the Claude backend; Phase 3 adds Codex.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -137,9 +138,38 @@ class BackendOnDiskListing(Protocol):
         ...
 
 
+def build_spawn_env(
+    session_id: str,
+    cwd: str | None,
+    alias: str | None,
+) -> dict[str, str]:
+    """Build the env dict for a spawned backend subprocess.
+
+    Inherits the daemon's env and overlays the agent-context vars peer-aware
+    MCP servers (e.g. ``blemees-peer-mcp``) consume on startup:
+
+    * ``BLEMEES_AGENT_SID`` — always set to the session_id, so any peer
+      MCP server can correlate to the agent. Format may not match the
+      peer's regex (UUIDs vs. ``sess_`` + 16 chars); the peer falls back
+      silently to minting its own when our value is rejected.
+    * ``BLEMEES_AGENT_HOME`` — set to ``cwd`` so the peer's identity store
+      defaults to the same directory the agent operates in (rather than
+      whatever cwd the MCP host happens to spawn the stdio child in).
+    * ``BLEMEES_AGENT_ALIAS`` — set only when the client supplied one;
+      lets the peer auto-claim it during the ``hello`` exchange.
+    """
+    env: dict[str, str] = {**os.environ, "BLEMEES_AGENT_SID": session_id}
+    if cwd:
+        env["BLEMEES_AGENT_HOME"] = cwd
+    if alias:
+        env["BLEMEES_AGENT_ALIAS"] = alias
+    return env
+
+
 __all__ = [
     "AgentBackend",
     "BackendOnDiskListing",
     "EventCallback",
     "KNOWN_BACKENDS",
+    "build_spawn_env",
 ]

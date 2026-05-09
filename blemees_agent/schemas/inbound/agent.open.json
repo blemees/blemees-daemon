@@ -19,6 +19,10 @@
       "minimum": 0,
       "description": "Highest `seq` the client has observed. Daemon replays ring buffer entries with `seq > last_seen_seq` before resuming live stream. Omit to skip replay."
     },
+    "alias": {
+      "type": "string",
+      "description": "Optional human-friendly identifier for this agent. The daemon exports it as BLEMEES_AGENT_ALIAS in the spawned backend's environment so peer-aware MCP servers (e.g. blemees-peer-mcp) can auto-claim it on hello. Format: lowercase [a-z][a-z0-9_-]{0,63}, must not start with `sess_`."
+    },
     "options": {
       "type": "object",
       "description": "Backend-specific knobs. Exactly the block matching `backend` is interpreted; unknown keys inside that block are rejected with invalid_message.",

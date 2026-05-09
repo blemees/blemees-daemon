@@ -354,6 +354,7 @@ class Connection:
                 stderr_rate_lines=self._config.stderr_rate_lines,
                 stderr_rate_window_s=self._config.stderr_rate_window_s,
                 include_raw_events=bool(msg.options.get("include_raw_events", False)),
+                alias=msg.alias,
             )
         if msg.backend == "codex":
             validate_codex_options(msg.options)
@@ -369,6 +370,7 @@ class Connection:
                 stderr_rate_window_s=self._config.stderr_rate_window_s,
                 include_raw_events=bool(msg.options.get("include_raw_events", False)),
                 thread_id=thread_id,
+                alias=msg.alias,
             )
         raise UnknownBackendError(msg.backend)
 

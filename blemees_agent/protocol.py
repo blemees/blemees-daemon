@@ -128,6 +128,7 @@ class OpenMessage:
     options: dict[str, Any]
     resume: bool
     last_seen_seq: int | None = None
+    alias: str | None = None
 
 
 @dataclasses.dataclass(slots=True)
@@ -202,7 +203,7 @@ def parse_hello(obj: dict[str, Any]) -> HelloMessage:
 
 
 _OPEN_TOP_LEVEL = frozenset(
-    {"type", "id", "session_id", "backend", "resume", "last_seen_seq", "options"}
+    {"type", "id", "session_id", "backend", "resume", "last_seen_seq", "options", "alias"}
 )
 
 
@@ -247,6 +248,10 @@ def parse_open(obj: dict[str, Any]) -> OpenMessage:
         if not isinstance(last_seen_seq, int) or last_seen_seq < 0:
             raise ProtocolError("'last_seen_seq' must be a non-negative integer")
 
+    alias = obj.get("alias")
+    if alias is not None and not isinstance(alias, str):
+        raise ProtocolError("'alias' must be a string")
+
     return OpenMessage(
         id=req_id,
         session_id=session_id,
@@ -254,6 +259,7 @@ def parse_open(obj: dict[str, Any]) -> OpenMessage:
         options=backend_options,
         resume=resume,
         last_seen_seq=last_seen_seq,
+        alias=alias or None,
     )
 
 
